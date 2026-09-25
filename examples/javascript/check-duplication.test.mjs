@@ -45,3 +45,23 @@ test('基线里的重复消失后未清理算虚挂', () => {
   assert.equal(result.status, 1);
   assert.match(result.stderr, /基线与现状对不上/);
 });
+
+const setters = (source) => ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta']
+  .map((field) => `set_${source}_${field}(${source}.${field}_value);`).join('\n');
+
+test('只差名字的一串简单调用不算重复', () => {
+  const root = fixture();
+  write(root, 'frontend/src/d.js', `${setters('prompt')}\n`);
+  write(root, 'frontend/src/e.js', `${setters('display')}\n`);
+  const result = run(root);
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('逐字相同的一串简单调用仍算重复', () => {
+  const root = fixture();
+  write(root, 'frontend/src/d.js', `${setters('prompt')}\n`);
+  write(root, 'frontend/src/e.js', `${setters('prompt')}\n`);
+  const result = run(root);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /frontend\/src\/d\.js:1-6、frontend\/src\/e\.js:1-6/);
+});

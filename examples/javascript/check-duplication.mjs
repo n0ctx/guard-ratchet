@@ -6,6 +6,8 @@
  * 比较前把标识符名字统一抹掉，空白和注释本来就不进 token，所以改名后复制
  * 过来的代码也算重复；字面量、关键字、运算符保持原样。
  * 片段短于 MIN_TOKENS 不报；被更大重复片段包住的小片段不重复报。
+ * 片段里每条语句都只是一次简单调用（setter、选择器、hook 取值、注册）时，
+ * 抹掉名字后只剩调用形状，这种片段要求保留名字后也逐字相同才报。
  *
  * 现有重复按规范化指纹写进 scripts/duplication-baseline.json：
  *   - 新指纹、或已有指纹多出一处复制 → 失败
@@ -37,11 +39,11 @@ const STATEMENT_LISTS = { Program: 'body', BlockStatement: 'body', StaticBlock: 
 function normalizeTokens(tokens) {
   const out = [];
   for (const tok of tokens) {
-    if (IDENTIFIER_TOKENS.has(tok.type)) out.push({ start: tok.range[0], value: '$' });
+    if (IDENTIFIER_TOKENS.has(tok.type)) out.push({ start: tok.range[0], value: '$', raw: tok.value });
     else if (tok.type === 'JSXText') {
       const text = tok.value.replace(/\s+/g, ' ').trim();
-      if (text) out.push({ start: tok.range[0], value: text });
-    } else out.push({ start: tok.range[0], value: tok.value });
+      if (text) out.push({ start: tok.range[0], value: text, raw: text });
+    } else out.push({ start: tok.range[0], value: tok.value, raw: tok.value });
   }
   return out;
 }
@@ -63,6 +65,33 @@ function isExecutable(stmt) {
   return true;
 }
 
+function isPlainValue(node) {
+  switch (node.type) {
+    case 'Identifier':
+    case 'Literal':
+    case 'ThisExpression':
+      return true;
+    case 'MemberExpression':
+      return !node.computed && isPlainValue(node.object);
+    case 'ArrowFunctionExpression':
+      return node.body.type !== 'BlockStatement' && isPlainValue(node.body);
+    case 'ObjectExpression':
+      return node.properties.every((prop) => prop.type === 'Property' && !prop.computed && isPlainValue(prop.value));
+    case 'ArrayExpression':
+      return node.elements.every((element) => element && isPlainValue(element));
+    default:
+      return false;
+  }
+}
+
+// 整条语句只是用现成的值调用一次函数，例如 setX(settings.x)、useStore((s) => s.x)
+function isPlainCall(stmt) {
+  let call = null;
+  if (stmt.type === 'ExpressionStatement') call = stmt.expression;
+  else if (stmt.type === 'VariableDeclaration' && stmt.declarations.length === 1) call = stmt.declarations[0].init;
+  return call?.type === 'CallExpression' && isPlainValue(call.callee) && call.arguments.every(isPlainValue);
+}
+
 // 把一个文件拆成若干「连续可执行语句」序列，每条语句带规范化 token 文本
 function statementRuns(file, tokens) {
   const runs = [];
@@ -81,7 +110,9 @@ function statementRuns(file, tokens) {
       run.push({
         rel: file.rel,
         text: tokens.slice(from, to).map((t) => t.value).join(' '),
+        raw: tokens.slice(from, to).map((t) => t.raw).join(' '),
         count: to - from,
+        plainCall: isPlainCall(stmt),
         range: stmt.range,
         startLine: stmt.loc.start.line,
         endLine: stmt.loc.end.line,
@@ -118,7 +149,10 @@ function extendPair(runs, [ra, pa], [rb, pb]) {
     len += 1;
   }
   if (tokens < MIN_TOKENS) return null;
-  return { tokens, first: a.slice(pa, pa + len), second: b.slice(pb, pb + len) };
+  const first = a.slice(pa, pa + len);
+  const second = b.slice(pb, pb + len);
+  if (first.every((s) => s.plainCall) && first.some((s, i) => s.raw !== second[i].raw)) return null;
+  return { tokens, first, second };
 }
 
 function occurrenceOf(stmts) {
