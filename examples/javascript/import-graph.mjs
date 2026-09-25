@@ -4,8 +4,15 @@
  * 引用来源：import / export from、require('…')、import('…') 的字符串字面量（含 React.lazy），
  * 以及测试辅助 freshImport('仓库根相对路径')。相对路径解析到实际文件
  * （补 .js/.jsx/.mjs/.cjs，目录补 index）。import() 的参数是表达式时，只认其中
- * 形如仓库根相对路径的字符串字面量（例如 import(pathToFileURL(path.resolve(ROOT, 'backend/x.js')).href)），
- * 其余 import(变量) 不猜。
+ * 形如仓库根相对路径的字符串字面量（例如 import(pathToFileURL(path.resolve(ROOT, 'backend/x.js')).href)）；
+ * freshImport(suite.path) 这种按对象属性取路径的，认本文件里所有 `path: '仓库路径'` 属性值。其余不猜。
+ *
+ * import() / freshImport 加载到的模块对象，按用法确定用到了哪些导出：
+ *   const { a, b } = await freshImport('x')   → a、b
+ *   const mod = await import('x'); mod.a      → a
+ *   mod['a']                                  → a
+ *   mod[suite.createName]                     → 本文件里所有 `createName: '…'` 属性的字符串值
+ * 模块对象被传给函数、展开、或下标取不到对应属性值时，按全部导出都用到处理。
  */
 
 import path from 'node:path';
@@ -48,6 +55,93 @@ function embeddedPaths(source) {
   return [...walk(source)].map(([n]) => stringValue(n)).filter((v) => v && CODE_PATH_RE.test(v));
 }
 
+function parentMap(tree) {
+  const parents = new Map();
+  for (const [node, parent] of walk(tree)) parents.set(node, parent);
+  return parents;
+}
+
+// 本文件里 `key: '字符串'` 形式的属性值；一个都没有时返回 null
+function propertyStrings(tree, key) {
+  const values = [];
+  for (const [node] of walk(tree)) {
+    if (node.type !== 'Property' || node.computed || moduleName(node.key) !== key) continue;
+    const value = stringValue(node.value);
+    if (value !== null) values.push(value);
+  }
+  return values.length ? values : null;
+}
+
+// mod[key] 里 key 能对应到的导出名；认不出返回 null
+function computedNames(tree, key) {
+  const literal = stringValue(key);
+  if (literal !== null) return [literal];
+  if (key.type === 'MemberExpression' && !key.computed) return propertyStrings(tree, key.property.name);
+  return null;
+}
+
+function patternKeys(pattern, tree) {
+  const names = [];
+  for (const prop of pattern.properties) {
+    if (prop.type === 'RestElement') return [ALL];
+    const name = prop.computed ? computedNames(tree, prop.key) : [moduleName(prop.key)];
+    if (!name) return [ALL];
+    names.push(...name);
+  }
+  return names;
+}
+
+// 名为 name 的模块对象在本文件里被取用的导出名
+function memberNames(tree, parents, name) {
+  const names = new Set();
+  for (const [node, parent] of walk(tree)) {
+    if (node.type !== 'Identifier' || node.name !== name) continue;
+    if (parent?.type === 'MemberExpression' && parent.object === node) {
+      const picked = parent.computed ? computedNames(tree, parent.property) : [parent.property.name];
+      if (!picked) return [ALL];
+      picked.forEach((n) => names.add(n));
+    } else if (parent?.type === 'VariableDeclarator' && parent.init === node && parent.id.type === 'ObjectPattern') {
+      patternKeys(parent.id, tree).forEach((n) => names.add(n));
+    } else if ((parent?.type === 'VariableDeclarator' && parent.id === node)
+        || (parent?.type === 'AssignmentExpression' && parent.left === node)
+        || (parent?.type === 'MemberExpression' && parent.property === node && !parent.computed)
+        || (parent?.type === 'Property' && parent.key === node && !parent.computed && !parent.shorthand)) {
+      continue;
+    } else {
+      return [ALL];
+    }
+  }
+  return [...names];
+}
+
+// 动态加载结果被怎样接住，决定用到哪些导出
+function loadedNames(tree, parents, loadNode) {
+  let node = loadNode;
+  let parent = parents.get(node);
+  while (parent?.type === 'AwaitExpression') {
+    node = parent;
+    parent = parents.get(node);
+  }
+  if (parent?.type === 'VariableDeclarator' && parent.init === node) {
+    if (parent.id.type === 'ObjectPattern') return patternKeys(parent.id, tree);
+    if (parent.id.type === 'Identifier') return memberNames(tree, parents, parent.id.name);
+  }
+  if (parent?.type === 'AssignmentExpression' && parent.right === node && parent.left.type === 'Identifier') {
+    return memberNames(tree, parents, parent.left.name);
+  }
+  return [ALL];
+}
+
+// freshImport 的参数：字面量路径，或 suite.path 这种按属性名取的仓库路径
+function rootImportTargets(tree, arg) {
+  const literal = stringValue(arg);
+  if (literal !== null) return [literal];
+  if (arg?.type === 'MemberExpression' && !arg.computed) {
+    return (propertyStrings(tree, arg.property.name) ?? []).filter((v) => CODE_PATH_RE.test(v));
+  }
+  return [];
+}
+
 // 返回 { refs: [{ base, names, lazy }], exports: [{ name, line }] }；base 是待解析的仓库相对路径，
 // lazy 表示运行到这里才加载（import() / freshImport），不构成加载期的循环
 function moduleShape(rel, tree) {
@@ -55,6 +149,7 @@ function moduleShape(rel, tree) {
   const exports = [];
   const ref = (base, names, lazy = false) => refs.push({ base, names, lazy });
   const exported = (node, names) => names.forEach((name) => exports.push({ name, line: node.loc.start.line }));
+  const parents = parentMap(tree);
   for (const [node] of walk(tree)) {
     if (node.type === 'ImportDeclaration') ref(relative(rel, node.source.value), importNames(node));
     else if (node.type === 'ExportNamedDeclaration') {
@@ -67,12 +162,15 @@ function moduleShape(rel, tree) {
     } else if (node.type === 'ExportDefaultDeclaration') exported(node, ['default']);
     else if (node.type === 'ImportExpression') {
       const literal = stringValue(node.source);
-      if (literal !== null) ref(relative(rel, literal), [ALL], true);
-      else embeddedPaths(node.source).forEach((base) => ref(base, [ALL], true));
-    }
-    else if (node.type === 'CallExpression' && node.callee.type === 'Identifier' && node.arguments.length === 1) {
+      const names = loadedNames(tree, parents, node);
+      if (literal !== null) ref(relative(rel, literal), names, true);
+      else embeddedPaths(node.source).forEach((base) => ref(base, names, true));
+    } else if (node.type === 'CallExpression' && node.callee.type === 'Identifier' && node.arguments.length === 1) {
       if (node.callee.name === 'require') ref(relative(rel, stringValue(node.arguments[0])), [ALL]);
-      else if (ROOT_IMPORTERS.has(node.callee.name)) ref(stringValue(node.arguments[0]), [ALL], true);
+      else if (ROOT_IMPORTERS.has(node.callee.name)) {
+        const names = loadedNames(tree, parents, node);
+        rootImportTargets(tree, node.arguments[0]).forEach((base) => ref(base, names, true));
+      }
     }
   }
   return { refs, exports };

@@ -55,7 +55,7 @@ test('约定入口、对外出口、import() 表达式里的仓库路径和 guar
   write(root, 'frontend/src/main.jsx', "import './components/index.js';\n");
   write(root, 'backend/log.js', 'export const level = 1;\n');
   write(root, 'backend/tests/log.test.js',
-    "const mod = await import(pathToFileURL(path.resolve(ROOT, 'backend/log.js')).href);\n");
+    "const mod = await import(pathToFileURL(path.resolve(ROOT, 'backend/log.js')).href);\nmod.level;\n");
   write(root, 'backend/lib.js', [
     'export function used() {}',
     'export const unused = 1;',
@@ -67,4 +67,31 @@ test('约定入口、对外出口、import() 表达式里的仓库路径和 guar
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /无引用文件 0 个、无引用导出 1 个/);
   assert.match(result.stdout, /backend\/lib\.js:3 外部系统按名字调用/);
+});
+
+test('动态加载的模块按取用的成员算引用：解构、点号、按属性名存的字符串下标', () => {
+  const root = fixture();
+  write(root, 'backend/q/a.js', 'export const pick = 1;\nexport const dotted = 2;\nexport const byKey = 3;\nexport const idle = 4;\n');
+  write(root, 'backend/q/b.js', 'export const create = 1;\nexport const unusedB = 2;\n');
+  write(root, 'backend/tests/q.test.js', [
+    "const { pick } = await freshImport('backend/q/a.js');",
+    "const mod = await freshImport('backend/q/a.js');",
+    "mod.dotted; mod['byKey'];",
+    "const suites = [{ path: 'backend/q/b.js', createName: 'create', otherName: 'unusedB' }];",
+    'for (const suite of suites) { const m = await freshImport(suite.path); m[suite.createName]; }',
+    '',
+  ].join('\n'));
+  const result = run(root);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /backend\/q\/a\.js#idle/);
+  assert.match(result.stderr, /backend\/q\/b\.js#unusedB/);
+  assert.doesNotMatch(result.stderr, /#(pick|dotted|byKey|create)\b/);
+});
+
+test('动态加载的模块对象被传出去时按全部导出都用到处理', () => {
+  const root = fixture();
+  write(root, 'backend/q/c.js', 'export const one = 1;\nexport const two = 2;\n');
+  write(root, 'backend/tests/c.test.js', "const mod = await freshImport('backend/q/c.js');\ninspect(mod);\n");
+  const result = run(root);
+  assert.equal(result.status, 0, result.stderr);
 });
