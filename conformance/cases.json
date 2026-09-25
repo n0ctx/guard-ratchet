@@ -63,6 +63,12 @@
     "expect": {"pass": true, "added": [], "grew": [], "stale": []}
   },
   {
+    "name": "提示不影响判定，也不进基线",
+    "findings": {"guard": "g", "scanned": 10, "advisory": ["a#f 复杂度 26，接近门槛 30"], "findings": [{"rule": "r", "key": "a"}]},
+    "baseline": {"version": 1, "guard": "g", "entries": {"r": {"a": 1}}},
+    "expect": {"pass": true, "added": [], "grew": [], "stale": []}
+  },
+  {
     "name": "硬规则违规直接失败，即使基线一致",
     "findings": {"guard": "g", "scanned": 10, "hard": ["t.test.js:3 提交了 .only"], "findings": []},
     "baseline": {"version": 1, "guard": "g", "entries": {}},
@@ -105,9 +111,9 @@
     "expect_error": true
   },
   {
-    "name": "更新基线：按规则和 key 排序，累加重复，去掉 0，不收硬规则",
+    "name": "更新基线：按规则和 key 排序，累加重复，去掉 0，不收硬规则和提示",
     "mode": "update",
-    "findings": {"guard": "g", "scanned": 10, "hard": ["x"], "findings": [
+    "findings": {"guard": "g", "scanned": 10, "hard": ["x"], "advisory": ["a 接近门槛"], "findings": [
       {"rule": "s", "key": "b"},
       {"rule": "r", "key": "z", "count": 2},
       {"rule": "r", "key": "a"},

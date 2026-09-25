@@ -10,6 +10,7 @@
   - `count`：非负整数。集合型规则（有或没有）用 1；计数型（某文件里出现几次）用次数；数值型（复杂度）用数值本身。
 - **基线（baseline）**：上次确认的发现快照 `{version, guard, entries: {rule: {key: count}}}`，提交进仓库。
 - **硬规则违规（hard）**：不进基线，出现即失败。
+- **提示（advisory）**：可选。只打印，不进基线，不影响判定。用于接近门槛的提前提醒、或检测本身不确定的信号；不要用它替代本该失败的规则。
 
 ## 判定
 
@@ -65,6 +66,7 @@
   "min_scanned": 100,
   "parse_failures": [],
   "hard": ["tests/a_test.py:3 提交了 .only"],
+  "advisory": ["src/b.py#load 复杂度 26，接近门槛 30"],
   "findings": [
     {"rule": "fn-complexity", "key": "src/a.py#parse", "count": 41, "detail": "可选的说明"}
   ]

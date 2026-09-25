@@ -8,6 +8,7 @@
     "min_scanned": 100,               # 低于此值说明遍历坏了（防空转通过），可省略
     "parse_failures": ["a.py"],       # 解析失败的文件，任何一个都算失败
     "hard": ["a_test.py:3 提交了 .only"],   # 直接失败、不进基线的违规
+    "advisory": ["src/b.py#load 复杂度 26，接近门槛 30"],  # 只提示：不进基线、不影响退出码，可省略
     "findings": [                     # 进基线的发现；同一 rule+key 出现多次会累加
       {"rule": "fn-complexity", "key": "src/a.py#parse", "count": 41, "detail": "可选说明"}
     ]
@@ -110,8 +111,17 @@ def detail_of(findings_doc):
     return {f"{f['rule']}:{f['key']}": f.get('detail') for f in findings_doc.get('findings', []) if f.get('detail')}
 
 
+def print_advisory(findings_doc):
+    items = findings_doc.get('advisory', [])
+    if items:
+        print(f'提示（不影响结果）：{len(items)} 条')
+        for item in items:
+            print(f'  {item}')
+
+
 def report(result, findings_doc, baseline_doc, update_hint):
     guard = findings_doc.get('guard')
+    print_advisory(findings_doc)
     if result['pass']:
         print(f"✓ {guard} 守卫通过：扫描 {findings_doc.get('scanned')}，基线外无新增")
         return
