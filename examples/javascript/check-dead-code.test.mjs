@@ -46,3 +46,25 @@ test('基线里的无引用导出删掉后未清理算虚挂', () => {
   assert.equal(result.status, 1);
   assert.match(result.stderr, /基线与现状对不上[\s\S]*backend\/lib\.js#unused/);
 });
+
+test('约定入口、对外出口、import() 表达式里的仓库路径和 guard-allow 标记都不报', () => {
+  const root = fixture();
+  write(root, 'desktop/src/preload.js', 'export const bridge = 1;\n');
+  write(root, 'frontend/src/components/index.js', "export { default as Button } from './Button.jsx';\n");
+  write(root, 'frontend/src/components/Button.jsx', 'export default function Button() {}\n');
+  write(root, 'frontend/src/main.jsx', "import './components/index.js';\n");
+  write(root, 'backend/log.js', 'export const level = 1;\n');
+  write(root, 'backend/tests/log.test.js',
+    "const mod = await import(pathToFileURL(path.resolve(ROOT, 'backend/log.js')).href);\n");
+  write(root, 'backend/lib.js', [
+    'export function used() {}',
+    'export const unused = 1;',
+    '// guard-allow(dead-code): 外部系统按名字调用',
+    'export const external = 2;',
+    '',
+  ].join('\n'));
+  const result = run(root);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /无引用文件 0 个、无引用导出 1 个/);
+  assert.match(result.stdout, /backend\/lib\.js:3 外部系统按名字调用/);
+});

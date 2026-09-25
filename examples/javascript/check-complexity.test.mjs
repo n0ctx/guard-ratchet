@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 
 import { useGuardFixture } from './guard-fixture.mjs';
 
@@ -76,4 +78,17 @@ test('基线函数简化后未更新算虚挂', () => {
   const result = run(root);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /backend\/legacy\.js#legacy: 记的是 41，实际 11/);
+});
+
+test('匿名函数按「外层函数名>调用名」命名，前面多一个函数不会让 key 错位', () => {
+  const root = makeRoot();
+  write(root, 'backend/many.js', Array.from({ length: 1500 }, (_, i) => `export function f${i}() {}`).join('\n'));
+  const callback = Array.from({ length: 31 }, (_, i) => `    if (x === ${i}) return ${i};`).join('\n');
+  const source = (extra) => `${extra}export function match(items) {\n  return items.filter((x) => {\n${callback}\n    return false;\n  });\n}\n`;
+  write(root, 'backend/match.js', source(''));
+  assert.equal(run(root, '--update-baseline').status, 0);
+  write(root, 'backend/match.js', source('setTimeout(() => {}, 0);\n'));
+  const result = run(root);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(readFileSync(path.join(root, 'scripts/complexity-baseline.json'), 'utf8'), /backend\/match\.js#match>filter/);
 });

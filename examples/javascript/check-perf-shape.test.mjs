@@ -77,3 +77,82 @@ test('基线里的循环内查询消失后未清理算虚挂', () => {
   assert.equal(result.status, 1);
   assert.match(result.stderr, /基线与现状对不上[\s\S]*t\.js#reorder#stmt\.run/);
 });
+
+test('事务里逐条写预编译语句不报，事务里逐条读照报', () => {
+  const root = fixture();
+  write(root, 'backend/db/queries/batch.js', [
+    "import db from '../index.js';",
+    'function insertAll(stmt, rows) { for (const r of rows) stmt.run(r); }',
+    'export function save(rows) {',
+    "  const stmt = db.prepare('INSERT INTO t VALUES (?)');",
+    "  const read = db.prepare('SELECT * FROM t WHERE id = ?');",
+    '  db.transaction(() => {',
+    '    insertAll(stmt, rows);',
+    '    rows.forEach((r) => stmt.run(r));',
+    '    for (const r of rows) read.get(r);',
+    '  })();',
+    '}',
+    '',
+  ].join('\n'));
+  const result = run(root);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /batch\.js#save#read\.get/);
+  assert.doesNotMatch(result.stderr, /stmt\.run/);
+});
+
+test('查询目录里不碰数据库的纯函数不算查询', () => {
+  const root = fixture();
+  write(root, 'backend/db/queries/items.js', [
+    "import db from '../index.js';",
+    'export function normalize(v) { return Number(v) || 1; }',
+    "export function getById(id) { return db.prepare('SELECT * FROM items WHERE id = ?').get(id); }",
+    'export function getViaHelper(id) { return getById(id); }',
+    '',
+  ].join('\n'));
+  write(root, 'backend/services/items.js', [
+    "import { normalize, getViaHelper } from '../db/queries/items.js';",
+    'export function load(ids) { for (const id of ids) { normalize(id); getViaHelper(id); } }',
+    '',
+  ].join('\n'));
+  const result = run(root);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /items\.js#load#getViaHelper/);
+  assert.doesNotMatch(result.stderr, /#normalize/);
+});
+
+test('guard-allow 标记覆盖紧随其后的语句段，并在输出里列出', () => {
+  const root = fixture();
+  write(root, 'backend/services/seed.js', [
+    "import { getById } from '../db/queries/items.js';",
+    'export function seed(ids) {',
+    '  // guard-allow(perf-shape): 固定小表',
+    '  const first = ids[0];',
+    '  for (const id of ids) getById(id, first);',
+    '',
+    '  for (const id of ids) getById(id);',
+    '}',
+    '',
+  ].join('\n'));
+  const result = run(root);
+  assert.equal(result.status, 1);
+  assert.equal(result.stderr.match(/seed\.js#seed#getById/g)?.length, 1);
+  assert.match(result.stderr, /有意保留（guard-allow）1 处：\n {2}backend\/services\/seed\.js:3 固定小表/);
+});
+
+test('guard-allow 没写理由、守卫名写错、已无违规都失败', () => {
+  const root = fixture();
+  write(root, 'backend/services/marks.js', [
+    '// guard-allow(perf-shape)',
+    'export const a = 1;',
+    '// guard-allow(perf): 写错名字',
+    'export const b = 2;',
+    '// guard-allow(perf-shape): 这里其实没有循环查询',
+    'export const c = 3;',
+    '',
+  ].join('\n'));
+  const result = run(root);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /marks\.js:1 标记没写理由/);
+  assert.match(result.stderr, /marks\.js:3 守卫名 `perf` 不存在/);
+  assert.match(result.stderr, /marks\.js:5 覆盖的代码里已经没有 perf-shape 违规/);
+});

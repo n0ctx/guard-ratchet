@@ -13,8 +13,12 @@
  *   - backend/package.json 的 test / test:coverage 会扫到 tests/e2e
  *
  * 记入 scripts/test-shape-baseline.json，只许降不许新增：
- *   - 每个测试文件里 listen( / initSchema( / chromium.launch 的次数（新文件超过 1 次算失败）
+ *   - 每个测试文件里 listen( / initSchema( / chromium.launch 的次数（新文件超过 1 次算失败）；
+ *     在同一函数里 listen 后马上 close 的是探测空闲端口，不算启动服务
  *   - test.skip / it.skip / describe.skip 的位置（文件 + 标题）
+ *
+ * 有意重复初始化（例如验证重复执行不出错）用 `// guard-allow(tests): 理由` 标在调用旁边，
+ * 规则见 guard-common.mjs。
  *
  * 用法：
  *   node scripts/check-tests.mjs [--root <dir>] [--baseline <path>] [--update-baseline]
@@ -25,7 +29,7 @@
 import { existsSync, globSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import {
-  BASELINE_NOTE, baselineFailures, collectCodeFiles, compareCounts, compareSets, countKeys, finish, loadBaseline,
+  BASELINE_NOTE, allowFailures, baselineFailures, collectAllowMarkers, collectCodeFiles, compareCounts, compareSets, countKeys, finish, loadBaseline,
   parseArgs, parseFiles, section, stringValue, suffixDuplicates, walk, writeBaseline,
 } from './guard-common.mjs';
 
@@ -180,10 +184,32 @@ function checkPlaywright(file, node, found) {
   }
 }
 
+// server.listen(...) 所在的 server 变量，在声明它的函数里又被 server.close(...)：探测空闲端口
+function isPortProbe(file, call) {
+  const obj = call.callee.type === 'MemberExpression' ? call.callee.object : null;
+  if (obj?.type !== 'Identifier') return false;
+  let owner = null;
+  for (const [node, parent] of walk(file.tree)) {
+    if (node.type === 'VariableDeclarator' && node.id.type === 'Identifier' && node.id.name === obj.name
+        && node.range[0] < call.range[0]) owner = parent;
+  }
+  const scope = owner && [...walk(file.tree)].map(([n]) => n)
+    .filter((n) => FUNCTION_TYPES.has(n.type) || n.type === 'FunctionDeclaration')
+    .filter((fn) => fn.range[0] <= owner.range[0] && owner.range[1] <= fn.range[1])
+    .sort((a, b) => (a.range[1] - a.range[0]) - (b.range[1] - b.range[0]))[0];
+  if (!scope) return false;
+  return [...walk(scope)].some(([n]) => n.type === 'CallExpression' && n.callee.type === 'MemberExpression'
+    && n.callee.object.type === 'Identifier' && n.callee.object.name === obj.name
+    && !n.callee.computed && n.callee.property.name === 'close');
+}
+
 function recordShape(file, call, found) {
   const name = calleeName(call.callee);
   const metric = HEAVY_SETUP.find((m) => m === name || (!m.includes('.') && lastName(name) === m));
-  if (metric) found.heavy.push(`${file.rel}#${metric}`);
+  if (metric && !(metric === 'listen' && isPortProbe(file, call))
+      && !found.allow.covers(file.rel, call.loc.start.line)) {
+    found.heavy.push(`${file.rel}#${metric}`);
+  }
   const info = testCall(call);
   if (info?.modifier === 'skip' && call.callee.type === 'MemberExpression') {
     found.skips.push(`${file.rel}#${info.root}.skip ${stringValue(call.arguments[0]) ?? '(匿名)'}`);
@@ -238,9 +264,11 @@ function collectTestShape(root) {
   const rels = SCAN_DIRS.flatMap((dir) => collectCodeFiles(root, dir))
     .filter((rel) => TEST_FILE_RE.test(rel));
   const { parsed, parseFailures } = parseFiles(root, rels);
-  const found = { hard: checkBackendScripts(root), heavy: [], skips: [] };
+  const allow = collectAllowMarkers(parsed, 'tests');
+  const found = { hard: checkBackendScripts(root), heavy: [], skips: [], allow };
   for (const file of parsed) inspectFile(file, found);
   return {
+    allow,
     hard: found.hard,
     heavySetup: countKeys(found.heavy),
     skips: suffixDuplicates(found.skips),
@@ -279,8 +307,9 @@ function main() {
   failures.push(...baselineFailures(compareSets(shape.skips, baseline.skips || []), {
     script: SCRIPT, addedTitle: '新增了永久跳过的测试；修好或删掉',
   }));
+  failures.push(...allowFailures(shape.allow));
 
-  finish('测试形态守卫', failures, `${shape.fileCount} 个测试文件`, BASELINE_NOTE);
+  finish('测试形态守卫', failures, `${shape.fileCount} 个测试文件`, BASELINE_NOTE, shape.allow.listing());
 }
 
 main();

@@ -80,3 +80,21 @@ test('基线里的跳过删掉后未清理算虚挂', () => {
   assert.match(result.stderr, /基线与现状对不上[\s\S]*a\.test\.js#test\.skip pending/);
   assert.match(result.stderr, /a\.test\.js#listen: 记的是 2，实际 0/);
 });
+
+test('listen 后在同一函数里 close 的端口探测不算启动，guard-allow 标记的调用不计数', () => {
+  const root = fixture();
+  write(root, 'backend/tests/b.test.js', [
+    "import test from 'node:test';",
+    "import assert from 'node:assert/strict';",
+    'async function freePort() { const probe = createServer(); probe.listen(0); await probe.close(); }',
+    "test('x', async () => { await freePort(); server.listen(0);",
+    '  // guard-allow(tests): 验证重复初始化不出错',
+    '  initSchema(db);',
+    '  initSchema(db);',
+    '  assert.ok(ready()); });',
+    '',
+  ].join('\n'));
+  const result = run(root);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /b\.test\.js:5 验证重复初始化不出错/);
+});

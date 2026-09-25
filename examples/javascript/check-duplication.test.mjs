@@ -65,3 +65,11 @@ test('逐字相同的一串简单调用仍算重复', () => {
   assert.equal(result.status, 1);
   assert.match(result.stderr, /frontend\/src\/d\.js:1-6、frontend\/src\/e\.js:1-6/);
 });
+
+test('guard-allow 标记的那处出现不计入，不足两处的重复组不报', () => {
+  const root = fixture();
+  write(root, 'backend/c.js', `// guard-allow(duplication): 与 a.js 必须逐字一致的镜像\n${block('sumC')}`);
+  const result = run(root);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /backend\/c\.js:1 与 a\.js 必须逐字一致的镜像/);
+});

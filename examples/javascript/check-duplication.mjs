@@ -13,6 +13,8 @@
  *   - 新指纹、或已有指纹多出一处复制 → 失败
  *   - 指纹消失或复制处变少 → 虚挂，必须 --update-baseline 清掉
  * 故意保留的平行实现只能通过 --update-baseline 留下，并在提交说明里写理由。
+ * 必须逐字保持一致的镜像代码（例如前后端各一份的同一算法）用 `// guard-allow(duplication): 理由`
+ * 标在片段旁边：被标记的那处出现不再计入，剩下不足两处的重复组不报。规则见 guard-common.mjs。
  *
  * 用法：
  *   node scripts/check-duplication.mjs [--root <dir>] [--baseline <path>] [--update-baseline]
@@ -23,7 +25,7 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import {
-  BASELINE_NOTE, baselineFailures, collectCodeFiles, compareCounts, finish, isTestPath, loadBaseline,
+  BASELINE_NOTE, allowFailures, baselineFailures, collectAllowMarkers, collectCodeFiles, compareCounts, finish, isTestPath, loadBaseline,
   parseArgs, parseFiles, walk, writeBaseline,
 } from './guard-common.mjs';
 
@@ -161,11 +163,12 @@ function occurrenceOf(stmts) {
   return {
     rel: first.rel,
     range: [first.range[0], last.range[1]],
+    startLine: first.startLine,
     location: `${first.rel}:${first.startLine}-${last.endLine}`,
   };
 }
 
-function findClones(runs) {
+function findClones(runs, allow) {
   const groups = new Map();
   for (const list of indexStatements(runs).values()) {
     for (let i = 0; i < list.length; i += 1) {
@@ -175,7 +178,7 @@ function findClones(runs) {
       }
     }
   }
-  return dropContained(groups);
+  return dropContained(groups, allow);
 }
 
 function addClone(groups, { tokens, first, second }) {
@@ -186,8 +189,8 @@ function addClone(groups, { tokens, first, second }) {
   for (const occ of [occurrenceOf(first), occurrenceOf(second)]) group.occurrences.set(occ.location, occ);
 }
 
-// 每处出现都落在别的更大重复片段里面的组不单独报
-function dropContained(groups) {
+// 每处出现都落在别的更大重复片段里面的组不单独报；被有意保留标记覆盖的出现不计入
+function dropContained(groups, allow) {
   const byFile = new Map();
   for (const group of groups.values()) {
     for (const occ of group.occurrences.values()) {
@@ -202,7 +205,9 @@ function dropContained(groups) {
   for (const [fingerprint, group] of [...groups.entries()].sort()) {
     const occs = [...group.occurrences.values()];
     if (occs.every(covered)) continue;
-    result[fingerprint] = { tokens: group.tokens, locations: occs.map((o) => o.location).sort() };
+    const kept = occs.filter((o) => !allow.covers(o.rel, o.startLine));
+    if (kept.length < 2) continue;
+    result[fingerprint] = { tokens: group.tokens, locations: kept.map((o) => o.location).sort() };
   }
   return result;
 }
@@ -211,13 +216,14 @@ function collectDuplicates(root) {
   const rels = SCAN_DIRS.flatMap((dir) => collectCodeFiles(root, dir)).filter((rel) => !isTestPath(rel));
   const { parsed, parseFailures } = parseFiles(root, rels, { tokens: true });
   const runs = parsed.flatMap((file) => statementRuns(file, normalizeTokens(file.tree.tokens)));
-  return { duplicates: findClones(runs), parseFailures, fileCount: rels.length };
+  const allow = collectAllowMarkers(parsed, 'duplication');
+  return { duplicates: findClones(runs, allow), allow, parseFailures, fileCount: rels.length };
 }
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 function main() {
   const args = parseArgs(process.argv.slice(2), DEFAULT_BASELINE);
-  const { duplicates, parseFailures, fileCount } = collectDuplicates(args.root);
+  const { duplicates, allow, parseFailures, fileCount } = collectDuplicates(args.root);
   const groupCount = Object.keys(duplicates).length;
 
   if (args.updateBaseline && !parseFailures.length) {
@@ -245,8 +251,10 @@ function main() {
     script: SCRIPT,
     addedTitle: `这些连续语句重复了（≥ ${MIN_TOKENS} token），而且不在基线里；抽成共用函数`,
   }));
+  failures.push(...allowFailures(allow));
 
-  finish('重复代码守卫', failures, `${fileCount} 个文件，重复 ${groupCount} 段（门槛 ${MIN_TOKENS} token）`, BASELINE_NOTE);
+  finish('重复代码守卫', failures, `${fileCount} 个文件，重复 ${groupCount} 段（门槛 ${MIN_TOKENS} token）`,
+    BASELINE_NOTE, allow.listing());
 }
 
 main();

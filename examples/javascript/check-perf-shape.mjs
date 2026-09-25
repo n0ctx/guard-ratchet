@@ -11,10 +11,15 @@
  *
  * 记入 scripts/perf-shape-baseline.json，新增算失败、消失算虚挂：
  *   - 循环体内调用 .prepare(，或对 prepare 出来的 Statement 调用 .get( / .all( / .run(，
- *     或调用从 backend/db/queries/ 导入的查询函数
- *     （一次查出再在内存里匹配不在循环里，不会被报）
+ *     或调用从 backend/db/queries/ 导入、确实会访问数据库的查询函数
+ *     （一次查出再在内存里匹配不在循环里，不会被报；查询目录里不碰数据库的纯函数不算查询）
+ *   - 例外：事务里对循环外预编译好的 Statement 逐条 .run( 是 better-sqlite3 推荐的批量写法，不报。
+ *     「事务里」指写在 .transaction( 的回调里，或所在函数在本文件里只从事务回调中被调用。
  *   - backend/app、backend/routes、backend/services 里 SELECT 语句既没有 WHERE 也没有 LIMIT
  *     （backend/services/import-export.js 除外）
+ *
+ * 检测器分不清的有意写法（一次性迁移、字段数有固定小上限的逐条写入）用
+ * `// guard-allow(perf-shape): 理由` 标在语句旁边，规则见 guard-common.mjs。
  *
  * 用法：
  *   node scripts/check-perf-shape.mjs [--root <dir>] [--baseline <path>] [--update-baseline]
@@ -24,8 +29,8 @@
 
 import path from 'node:path';
 import {
-  BASELINE_NOTE, baselineFailures, collectCodeFiles, compareSets, finish, isTestPath, loadBaseline,
-  parseArgs, parseFiles, patternNames, section, suffixDuplicates, walk, writeBaseline,
+  BASELINE_NOTE, allowFailures, baselineFailures, collectAllowMarkers, collectCodeFiles, compareSets, finish,
+  isTestPath, loadBaseline, parseArgs, parseFiles, patternNames, section, suffixDuplicates, walk, writeBaseline,
 } from './guard-common.mjs';
 
 const SCRIPT = 'check-perf-shape.mjs';
@@ -40,11 +45,16 @@ const FUNCTION_TYPES = new Set(['FunctionDeclaration', 'FunctionExpression', 'Ar
 const STATEMENT_METHODS = new Set(['get', 'all', 'run']);
 const ITERATION_METHODS = new Set(['map', 'flatMap', 'filter', 'reduce', 'some', 'every', 'find', 'findIndex']);
 const QUERY_DIR = 'backend/db/queries/';
+const DB_MODULE = 'backend/db/index.js';
+const DB_METHODS = new Set(['prepare', 'exec', 'transaction', 'pragma']);
 
 // ─── AST 小工具 ──────────────────────────────────────────────────────────────
+// comments / tokens 是解析器附带的注释与 token 列表，不是语法树节点
+const SKIP_KEYS = new Set(['loc', 'range', 'parent', 'comments', 'tokens']);
+
 function* children(node) {
   for (const key of Object.keys(node)) {
-    if (key === 'loc' || key === 'range' || key === 'parent') continue;
+    if (SKIP_KEYS.has(key)) continue;
     const value = node[key];
     if (Array.isArray(value)) {
       for (const child of value) if (child && typeof child.type === 'string') yield child;
@@ -104,19 +114,159 @@ function statementNames(tree) {
   return names;
 }
 
-// 从 backend/db/queries/ 导入的本地名：names 是具名/默认导入，namespaces 是 import * as
-function queryImports(file) {
+function importTarget(file, node) {
+  if (node.type !== 'ImportDeclaration' || !node.source.value.startsWith('.')) return null;
+  const target = path.posix.join(path.posix.dirname(file.rel), node.source.value);
+  return target.endsWith('.js') ? target : `${target}.js`;
+}
+
+// ─── 查询层里哪些导出真的访问数据库 ──────────────────────────────────────────
+// 返回 Map<查询文件, Set<会访问数据库的导出名>>。直接用到 db 模块、调用 prepare/exec/transaction，
+// 或调用了会访问数据库的本地函数 / 其他查询文件的导出，都算访问；认不出形状的导出一律算访问。
+function queryShape(file) {
+  const imports = new Map();
+  const dbLocals = new Set();
+  const locals = new Map();
+  const exported = new Map();
+  for (const node of file.tree.body) {
+    const target = importTarget(file, node);
+    if (target) {
+      for (const spec of node.specifiers) {
+        if (target === DB_MODULE) dbLocals.add(spec.local.name);
+        else if (target.startsWith(QUERY_DIR)) imports.set(spec.local.name, { target, name: spec.imported?.name ?? 'default' });
+      }
+    }
+    const decl = node.type === 'ExportNamedDeclaration' ? node.declaration : node;
+    if (decl?.type === 'FunctionDeclaration') {
+      locals.set(decl.id.name, decl);
+      if (decl !== node) exported.set(decl.id.name, decl.id.name);
+    } else if (decl?.type === 'VariableDeclaration') {
+      for (const d of decl.declarations) {
+        const fn = FUNCTION_TYPES.has(d.init?.type) ? d.init : null;
+        for (const name of patternNames(d.id)) {
+          locals.set(name, fn);
+          if (decl !== node) exported.set(name, name);
+        }
+      }
+    }
+    if (node.type === 'ExportNamedDeclaration' && !node.declaration) {
+      for (const spec of node.specifiers) {
+        const local = spec.local.name;
+        if (node.source) imports.set(`#reexport:${spec.exported.name}`, { target: importTarget(file, node), name: local });
+        exported.set(spec.exported.name, node.source ? `#reexport:${spec.exported.name}` : local);
+      }
+    }
+  }
+  return { imports, dbLocals, locals, exported };
+}
+
+function touchesDirectly(fnNode, shape) {
+  for (const [node] of walk(fnNode)) {
+    if (node.type === 'Identifier' && shape.dbLocals.has(node.name)) return true;
+    if (isMethodCall(node, DB_METHODS)) return true;
+  }
+  return false;
+}
+
+function calledNames(fnNode) {
+  const names = new Set();
+  for (const [node] of walk(fnNode)) {
+    if (node.type === 'CallExpression' && node.callee.type === 'Identifier') names.add(node.callee.name);
+  }
+  return names;
+}
+
+function dbTouchingExports(parsed) {
+  const shapes = new Map(parsed.filter((f) => f.rel.startsWith(QUERY_DIR)).map((f) => [f.rel, queryShape(f)]));
+  // touching: Map<rel, Set<本地名>>；本地名不是函数（工厂调用结果等）时直接算访问
+  const touching = new Map();
+  for (const [rel, shape] of shapes) {
+    touching.set(rel, new Set([...shape.locals].filter(([, fn]) => !fn || touchesDirectly(fn, shape)).map(([n]) => n)));
+  }
+  const importTouches = (shape, local) => {
+    const ref = shape.imports.get(local);
+    if (!ref) return false;
+    const other = shapes.get(ref.target);
+    if (!other) return true;
+    const resolved = other.exported.get(ref.name);
+    return resolved === undefined || touching.get(ref.target).has(resolved) || importTouches(other, resolved);
+  };
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [rel, shape] of shapes) {
+      const set = touching.get(rel);
+      for (const [name, fn] of shape.locals) {
+        if (set.has(name)) continue;
+        const calls = calledNames(fn);
+        if ([...calls].some((c) => set.has(c) || importTouches(shape, c))) {
+          set.add(name);
+          changed = true;
+        }
+      }
+    }
+  }
+  const result = new Map();
+  for (const [rel, shape] of shapes) {
+    const set = touching.get(rel);
+    result.set(rel, new Set([...shape.exported]
+      .filter(([, local]) => set.has(local) || importTouches(shape, local) || !shape.locals.has(local) && !shape.imports.has(local))
+      .map(([name]) => name)));
+  }
+  return result;
+}
+
+// 从 backend/db/queries/ 导入、会访问数据库的本地名：names 是具名/默认导入，namespaces 是 import * as
+function queryImports(file, touchingExports) {
   const names = new Set();
   const namespaces = new Set();
   for (const node of file.tree.body) {
-    if (node.type !== 'ImportDeclaration' || !node.source.value.startsWith('.')) continue;
-    const target = path.posix.join(path.posix.dirname(file.rel), node.source.value);
-    if (!target.startsWith(QUERY_DIR)) continue;
+    const target = importTarget(file, node);
+    if (!target?.startsWith(QUERY_DIR)) continue;
+    const touching = touchingExports.get(target);
     for (const spec of node.specifiers) {
-      (spec.type === 'ImportNamespaceSpecifier' ? namespaces : names).add(spec.local.name);
+      if (spec.type === 'ImportNamespaceSpecifier') namespaces.add(spec.local.name);
+      else if (!touching || touching.has(spec.imported?.name ?? 'default')) names.add(spec.local.name);
     }
   }
   return { names, namespaces };
+}
+
+// ─── 事务上下文 ──────────────────────────────────────────────────────────────
+// 事务回调，以及在本文件里只从事务回调中被调用的未导出函数
+function transactionalFunctions(tree) {
+  const tx = new Set();
+  const declared = new Map();
+  const exported = new Set();
+  for (const [node, parent] of walk(tree)) {
+    if (isMethodCall(node, new Set(['transaction'])) && FUNCTION_TYPES.has(node.arguments[0]?.type)) tx.add(node.arguments[0]);
+    const name = node.type === 'FunctionDeclaration' ? node.id?.name
+      : FUNCTION_TYPES.has(node.type) && parent?.type === 'VariableDeclarator' && parent.id.type === 'Identifier' ? parent.id.name : null;
+    if (name) declared.set(name, node);
+    if (node.type === 'ExportNamedDeclaration' && node.declaration) {
+      patternNames(node.declaration.type === 'VariableDeclaration' ? node.declaration : node.declaration.id)
+        .forEach((n) => exported.add(n));
+    }
+    if (node.type === 'ExportNamedDeclaration' && !node.source) node.specifiers.forEach((sp) => exported.add(sp.local.name));
+  }
+  const calls = [];
+  for (const [node] of walk(tree)) {
+    if (node.type === 'CallExpression' && node.callee.type === 'Identifier' && declared.has(node.callee.name)) calls.push(node);
+  }
+  const inside = (node) => [...tx].some((fn) => fn.range[0] <= node.range[0] && node.range[1] <= fn.range[1]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [name, fn] of declared) {
+      if (tx.has(fn) || exported.has(name)) continue;
+      const sites = calls.filter((c) => c.callee.name === name);
+      if (sites.length && sites.every(inside)) {
+        tx.add(fn);
+        changed = true;
+      }
+    }
+  }
+  return tx;
 }
 
 // ─── 规则 ────────────────────────────────────────────────────────────────────
@@ -156,10 +306,18 @@ function checkDeepLoop(loopNode, body, outerLoops, ctx) {
     + `最内层引用了外层循环变量 ${used.join(', ')}；先按键建索引再单层遍历`);
 }
 
+// 事务里对预编译 Statement 的逐条写入（.prepare 本身在循环里时另外会被报）
+function isBatchWrite(node, state, ctx) {
+  return state.inTx && isMethodCall(node, new Set(['run'])) && node.callee.object.type === 'Identifier'
+    && ctx.stmtNames.has(node.callee.object.name);
+}
+
 function inspectNode(node, state, ctx) {
-  if ((state.loops.length || state.perItem) && node.type === 'CallExpression') {
+  if ((state.loops.length || state.perItem) && node.type === 'CallExpression' && !isBatchWrite(node, state, ctx)) {
     const call = loopQueryCall(node, ctx);
-    if (call) ctx.found.loopQueries.push(`${ctx.file.rel}#${state.fn}#${call}`);
+    if (call && !ctx.allow.covers(ctx.file.rel, node.loc.start.line)) {
+      ctx.found.loopQueries.push(`${ctx.file.rel}#${state.fn}#${call}`);
+    }
   }
   if (!ctx.sqlScope) return;
   const text = sqlText(node);
@@ -167,7 +325,9 @@ function inspectNode(node, state, ctx) {
 }
 
 function visit(node, parent, state, ctx) {
-  const next = FUNCTION_TYPES.has(node.type) ? { ...state, fn: functionName(node, parent) ?? state.fn } : state;
+  const next = FUNCTION_TYPES.has(node.type)
+    ? { ...state, fn: functionName(node, parent) ?? state.fn, inTx: state.inTx || ctx.txFunctions.has(node) }
+    : state;
   inspectNode(node, next, ctx);
   const loop = loopOf(node);
   const iterator = isMethodCall(node, ITERATION_METHODS) && FUNCTION_TYPES.has(node.arguments[0]?.type)
@@ -192,12 +352,20 @@ function collectPerfShape(root) {
   const rels = SCAN_DIRS.flatMap((dir) => collectCodeFiles(root, dir)).filter((rel) => !isTestPath(rel));
   const { parsed, parseFailures } = parseFiles(root, rels);
   const found = { hard: [], loopQueries: [], selects: [] };
+  const allow = collectAllowMarkers(parsed, 'perf-shape');
+  const touchingExports = dbTouchingExports(parsed);
   for (const file of parsed) {
     const sqlScope = SQL_DIRS.some((dir) => file.rel.startsWith(dir)) && !SQL_EXEMPT.has(file.rel);
-    const ctx = { file, found, sqlScope, stmtNames: statementNames(file.tree), queries: queryImports(file) };
-    visit(file.tree, null, { loops: [], perItem: false, fn: '(顶层)' }, ctx);
+    const ctx = {
+      file, found, sqlScope, allow,
+      stmtNames: statementNames(file.tree),
+      queries: queryImports(file, touchingExports),
+      txFunctions: transactionalFunctions(file.tree),
+    };
+    visit(file.tree, null, { loops: [], perItem: false, inTx: false, fn: '(顶层)' }, ctx);
   }
   return {
+    allow,
     hard: found.hard,
     loopQueries: suffixDuplicates(found.loopQueries),
     selects: suffixDuplicates(found.selects),
@@ -236,8 +404,9 @@ function main() {
   failures.push(...baselineFailures(compareSets(shape.selects, baseline.selectsWithoutFilter || []), {
     script: SCRIPT, addedTitle: '这些 SELECT 既没有 WHERE 也没有 LIMIT，而且不在基线里；加条件或挪进 backend/db/queries',
   }));
+  failures.push(...allowFailures(shape.allow));
 
-  finish('运行形态守卫', failures, summary, BASELINE_NOTE);
+  finish('运行形态守卫', failures, summary, BASELINE_NOTE, shape.allow.listing());
 }
 
 main();

@@ -1,8 +1,13 @@
 /**
- * 源码守卫公共部分：仓库遍历、espree 解析、命令行参数、基线读写
+ * 源码守卫公共部分：仓库遍历、espree 解析、命令行参数、基线读写、有意保留标记
  *
  * 供 check-duplication / check-dead-code / check-tests / check-perf-shape 使用，
  * 扫描规则与 check-complexity.mjs 一致：跳过依赖/产物/数据目录和点开头的目录。
+ *
+ * 有意保留标记：检测器分不清、但确实是有意为之的写法，在代码旁边写
+ *   // guard-allow(<守卫名>): <理由>
+ * 标记单独占一行，覆盖紧随其后的那条语句，以及与它紧挨着、中间没有空行的后续同级语句。被覆盖的发现不进基线；标记跟着代码走，搬家改名不失效。
+ * 没写理由、守卫名写错、覆盖范围里已经没有违规的标记都算失败；每次运行都列出全部标记。
  */
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
@@ -13,8 +18,8 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const espree = require('espree');
 
-export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-export const BASELINE_VERSION = 1;
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const BASELINE_VERSION = 1;
 export const BASELINE_NOTE = '，基线外无新增';
 
 export const CODE_SUFFIXES = new Set(['.js', '.jsx', '.mjs', '.cjs']);
@@ -53,7 +58,7 @@ function walkDir(dir, relPrefix, accept, out) {
   }
 }
 
-export function parseCode(text, { tokens = false } = {}) {
+function parseCode(text, { tokens = false } = {}) {
   for (const sourceType of ['module', 'script']) {
     try {
       return espree.parse(text, {
@@ -63,6 +68,7 @@ export function parseCode(text, { tokens = false } = {}) {
         loc: true,
         range: true,
         tokens,
+        comment: true,
       });
     } catch { /* 尝试下一种 sourceType */ }
   }
@@ -82,11 +88,14 @@ export function parseFiles(root, rels, options) {
   return { parsed, parseFailures };
 }
 
+// comments / tokens 是解析器附带的注释与 token 列表，不是语法树节点
+const SKIP_KEYS = new Set(['loc', 'range', 'parent', 'comments', 'tokens']);
+
 export function* walk(node, parent = null) {
   if (!node || typeof node.type !== 'string') return;
   yield [node, parent];
   for (const key of Object.keys(node)) {
-    if (key === 'loc' || key === 'range' || key === 'parent') continue;
+    if (SKIP_KEYS.has(key)) continue;
     const value = node[key];
     if (Array.isArray(value)) {
       for (const child of value) if (child && typeof child.type === 'string') yield* walk(child, node);
@@ -189,14 +198,17 @@ export function countKeys(keys) {
   return counts;
 }
 
-// passNote 只在通过时附在摘要后面
-export function finish(label, failures, summary, passNote = '') {
+// passNote 只在通过时附在摘要后面；allowed 是有意保留标记清单，通过与否都列出
+export function finish(label, failures, summary, passNote = '', allowed = []) {
+  const listing = allowed.length ? `${section(`有意保留（guard-allow）${allowed.length} 处：`, allowed)}\n` : '';
   if (failures.length) {
     console.error(`\n✖ ${label}未通过（${summary}）\n`);
     for (const f of failures) console.error(`${f}\n`);
+    if (listing) console.error(listing);
     process.exit(1);
   }
   console.log(`✓ ${label}通过：${summary}${passNote}`);
+  if (listing) console.log(listing);
   process.exit(0);
 }
 
@@ -216,4 +228,99 @@ export function baselineFailures(diff, { script, addedTitle }) {
     failures.push(section(`基线与现状对不上（已改善或已消失），运行 ${update} 清掉：`, diff.stale));
   }
   return failures;
+}
+
+// ─── 有意保留标记 ─────────────────────────────────────────────────────────────
+const ALLOW_GUARDS = ['dead-code', 'duplication', 'perf-shape', 'tests'];
+const ALLOW_RE = /^\s*\*?\s*guard-allow\(([^)]*)\)\s*(?::\s*(.*?))?\s*$/s;
+
+// 每行开头最大的语句/表达式节点，连同它所在的同级列表
+function lineStarts(tree) {
+  const byLine = new Map();
+  for (const [node, parent] of walk(tree)) {
+    if (node === tree || !node.loc) continue;
+    const line = node.loc.start.line;
+    const size = node.range[1] - node.range[0];
+    const prev = byLine.get(line);
+    if (!prev || size > prev.size) byLine.set(line, { node, parent, size });
+  }
+  return byLine;
+}
+
+function siblingsOf(node, parent) {
+  if (!parent) return null;
+  for (const value of Object.values(parent)) {
+    if (Array.isArray(value) && value.includes(node)) return value;
+  }
+  return null;
+}
+
+// 标记覆盖的行区间 [start, end]：起始节点 + 后面紧挨着（中间没有空行）的同级节点
+function coverage(tree, comment, byLine) {
+  let line = comment.loc.end.line + 1;
+  while (line <= tree.loc.end.line && !byLine.has(line)) line += 1;
+  const hit = byLine.get(line);
+  if (!hit) return null;
+  let end = hit.node.loc.end.line;
+  const siblings = siblingsOf(hit.node, hit.parent) ?? [];
+  for (const next of siblings.slice(siblings.indexOf(hit.node) + 1)) {
+    if (next.loc.start.line !== end + 1) break;
+    end = next.loc.end.line;
+  }
+  return [line, end];
+}
+
+class AllowMarkers {
+  constructor(guard, markers, malformed) {
+    this.guard = guard;
+    this.markers = markers;
+    this.malformed = malformed;
+  }
+
+  // 某处发现是否被标记覆盖；覆盖到的标记记为用过
+  covers(rel, line) {
+    const hits = this.markers.filter((m) => m.rel === rel && line >= m.range[0] && line <= m.range[1]);
+    hits.forEach((m) => { m.used = true; });
+    return hits.length > 0;
+  }
+
+  // 检测跑完后调用：没写理由 / 守卫名写错 / 覆盖范围里已无违规的标记
+  problems() {
+    const stale = this.markers.filter((m) => !m.used)
+      .map((m) => `${m.where} 覆盖的代码里已经没有 ${this.guard} 违规，删掉这个标记`);
+    return [...this.malformed, ...stale];
+  }
+
+  listing() {
+    return this.markers.map((m) => `${m.where} ${m.reason}`);
+  }
+}
+
+/** 收集 guard 这个守卫在 parsed 文件里的标记，返回 AllowMarkers */
+export function collectAllowMarkers(parsed, guard) {
+  const markers = [];
+  const malformed = [];
+  for (const file of parsed) {
+    const byLine = lineStarts(file.tree);
+    for (const comment of file.tree.comments || []) {
+      const match = ALLOW_RE.exec(comment.value);
+      if (!match) continue;
+      const where = `${file.rel}:${comment.loc.start.line}`;
+      const name = match[1].trim();
+      const reason = (match[2] ?? '').trim();
+      const range = coverage(file.tree, comment, byLine);
+      if (!ALLOW_GUARDS.includes(name)) malformed.push(`${where} 守卫名 \`${name}\` 不存在（可用：${ALLOW_GUARDS.join('、')}）`);
+      else if (name !== guard) continue;
+      else if (!reason) malformed.push(`${where} 标记没写理由：写成 \`guard-allow(${name}): 为什么这里是有意的\``);
+      else if (!range) malformed.push(`${where} 标记后面没有代码可覆盖`);
+      else markers.push({ rel: file.rel, where, reason, range, used: false });
+    }
+  }
+  return new AllowMarkers(guard, markers, malformed);
+}
+
+// 标记问题并入失败列表
+export function allowFailures(allow) {
+  const problems = allow.problems();
+  return problems.length ? [section('有意保留标记有问题（guard-allow）：', problems)] : [];
 }

@@ -7,16 +7,17 @@
 | 文件 | 常量 | 含义 |
 |---|---|---|
 | check-duplication.mjs / check-perf-shape.mjs | `SCAN_DIRS` | 正式代码目录 |
-| check-perf-shape.mjs | `QUERY_DIR` | 查询层目录（用来识别业务层的 N+1） |
+| check-perf-shape.mjs | `QUERY_DIR`、`DB_MODULE` | 查询层目录（用来识别业务层的 N+1）；数据库连接模块（判断查询层函数是否真的访问数据库） |
 | check-perf-shape.mjs | `SQL_DIRS`、`SQL_EXEMPT` | 检查无条件 SELECT 的业务层目录与例外 |
 | check-tests.mjs | `SCAN_DIRS`、`E2E_DIR`、`BACKEND_TEST_SCRIPTS` | 测试目录、端到端目录、需要排除端到端的测试命令 |
 | check-dead-code.mjs | `ENTRY_FILES`、`HTML_ENTRIES`、`HOOK_FILE_RE` | 程序入口、HTML 入口、按目录加载的插件 |
+| check-dead-code.mjs | `CONVENTION_ENTRIES`、`PUBLIC_API` | 按路径字符串加载或供复制的文件；对外约定的出口（导出不逐个报） |
 | import-graph.mjs | `ROOT_IMPORTERS` | 测试里按字符串路径加载模块的辅助函数 |
 | check-complexity.mjs | `MIN_FUNCTION_COUNT` | 扫描下限（防空转） |
 
 | 文件 | 内容 |
 |---|---|
-| guard-common.mjs | 遍历、解析、参数、基线读写与比对 |
+| guard-common.mjs | 遍历、解析、参数、基线读写与比对、`guard-allow` 有意保留标记 |
 | import-graph.mjs | 仓内引用图（死代码与循环依赖共用） |
 | guard-fixture.mjs | 夹具测试辅助：临时仓库、写文件、运行守卫 |
 | check-complexity.mjs | 圈复杂度（数值型基线） |
