@@ -13,6 +13,10 @@
  * 复杂度算法是自带的近似式（分支/循环/catch/三元/逻辑运算符各计一），数值与
  * 专业工具不完全相同也没关系——它只用来和自己的历史比。
  *
+ * 同一文件里只被一处调用的私有函数，判断数算回调用方。把判断剪到旁边再调用
+ * 一次，分数和没剪一样，不能靠搬家达标。被两处及以上调用，或导出给别的文件，
+ * 才单独计分。
+ *
  * 用法：
  *   node scripts/check-complexity.mjs [--root <dir>] [--baseline <path>] [--update-baseline] [--ignore <glob>]
  *
@@ -74,30 +78,89 @@ function matchGlob(rel, pattern) {
   return rx.test(rel);
 }
 
-function* walk(node, parent = null) {
+function* walk(node, parent = null, stopAtFunction = false) {
   if (!node || typeof node.type !== 'string') return;
   yield [node, parent];
+  if (stopAtFunction && parent && isFunctionRoot(node, parent)) return;
   for (const key of Object.keys(node)) {
     if (key === 'loc' || key === 'range' || key === 'parent') continue;
     const value = node[key];
     if (Array.isArray(value)) {
-      for (const child of value) if (child && typeof child.type === 'string') yield* walk(child, node);
+      for (const child of value) if (child && typeof child.type === 'string') yield* walk(child, node, stopAtFunction);
     } else if (value && typeof value.type === 'string') {
-      yield* walk(value, node);
+      yield* walk(value, node, stopAtFunction);
     }
   }
 }
 
 // ─── 复杂度计算 ──────────────────────────────────────────────────────────────
-function complexityOf(fn) {
-  let score = 1;
+function isFunctionRoot(node, parent) {
+  return FUNCTION_TYPES.has(node.type) && !(parent?.type === 'MethodDefinition' && parent.value !== node);
+}
+
+function isDecision(node) {
+  if (DECISION_NODES.has(node.type)) return true;
+  if (node.type === 'SwitchCase' && node.test) return true;
+  return node.type === 'LogicalExpression' && ['&&', '||', '??'].includes(node.operator);
+}
+
+function decisionCount(fn) {
+  let score = 0;
   for (const [node] of walk(fn)) {
-    if (DECISION_NODES.has(node.type)) score += 1;
-    else if (node.type === 'SwitchCase' && node.test) score += 1;
-    else if (node.type === 'LogicalExpression'
-        && ['&&', '||', '??'].includes(node.operator)) score += 1;
+    if (node !== fn && isDecision(node)) score += 1;
   }
   return score;
+}
+
+function calleeName(node) {
+  if (node.type !== 'CallExpression') return null;
+  if (node.callee.type === 'Identifier') return node.callee.name;
+  return null;
+}
+
+function fileScores(tree, rel) {
+  const functions = [];
+  const nameCounts = new Map();
+  for (const [node, parent] of walk(tree)) {
+    if (!isFunctionRoot(node, parent)) continue;
+    const name = functionName(node, parent);
+    const occurrence = (nameCounts.get(name) || 0) + 1;
+    nameCounts.set(name, occurrence);
+    functions.push({
+      node,
+      name,
+      key: `${rel}#${name}${occurrence > 1 ? `~${occurrence}` : ''}`,
+      exported: parent?.type === 'ExportNamedDeclaration' || parent?.type === 'ExportDefaultDeclaration',
+      decisions: decisionCount(node),
+    });
+  }
+
+  const callsByName = new Map();
+  for (const fn of functions) {
+    for (const [node] of walk(fn.node, null, true)) {
+      const called = calleeName(node);
+      if (!called) continue;
+      const callers = callsByName.get(called) || [];
+      callers.push(fn);
+      callsByName.set(called, callers);
+    }
+  }
+
+  for (const fn of functions) {
+    if (fn.exported || nameCounts.get(fn.name) !== 1) continue;
+    const callers = callsByName.get(fn.name) || [];
+    const distinct = [...new Set(callers)];
+    if (distinct.length !== 1 || distinct[0] === fn) continue;
+    const caller = distinct[0];
+    const insideCaller = fn.node.start >= caller.node.start && fn.node.end <= caller.node.end;
+    if (!insideCaller) caller.decisions += fn.decisions;
+  }
+
+  const scores = new Map();
+  for (const fn of functions) {
+    scores.set(fn.key, fn.decisions + 1);
+  }
+  return scores;
 }
 
 function functionName(node, parent) {
@@ -139,16 +202,7 @@ function collectScores(extraIgnores) {
     const text = readFileSync(path.join(ROOT, rel), 'utf8');
     const tree = parseCode(text);
     if (!tree) { parseFailures.push(rel); continue; }
-    const nameCounts = new Map();
-    for (const [node, parent] of walk(tree)) {
-      if (!FUNCTION_TYPES.has(node.type)) continue;
-      if (parent?.type === 'MethodDefinition' && parent.value !== node) continue;
-      const name = functionName(node, parent);
-      const occurrence = (nameCounts.get(name) || 0) + 1;
-      nameCounts.set(name, occurrence);
-      const key = `${rel}#${name}${occurrence > 1 ? `~${occurrence}` : ''}`;
-      scores.set(key, complexityOf(node));
-    }
+    for (const [key, score] of fileScores(tree, rel)) scores.set(key, score);
   }
   return { scores, parseFailures, fileCount: rels.length };
 }
@@ -236,7 +290,8 @@ function main() {
     failures.push(
       `这些函数圈复杂度超过 ${LIMIT}，而且不在基线里：\n`
       + newOffenders.map(([k, v]) => `  ${k}: ${v}`).join('\n')
-      + '\n拆成几个有名字的步骤；确实是固有复杂度（多系统对齐那种）就运行 '
+      + '\n这次改动若把两件不同的事写进了同一个函数，把那件新事挪出去；只为降分搬代码不会通过。'
+      + '确实是固有复杂度（多系统对齐那种）就运行 '
       + '`node scripts/check-complexity.mjs --update-baseline` 并在提交说明里给出理由。',
     );
   }

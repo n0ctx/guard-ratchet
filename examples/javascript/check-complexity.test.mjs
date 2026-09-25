@@ -33,6 +33,43 @@ test('新增超标函数或基线函数变复杂都失败', () => {
   assert.match(result.stderr, /backend\/legacy\.js#legacy: 41 → 46/);
 });
 
+test('把判断剪到只被一处调用的私有函数，调用方分数不降', () => {
+  const root = fixture();
+  write(root, 'backend/legacy.js', `function step(x) {
+  if (x === 1) return 1;
+  if (x === 2) return 2;
+  return 0;
+}
+export function legacy(x) {
+  step(x);
+${Array.from({ length: 38 }, (_, i) => `  if (x === ${i + 3}) return ${i};`).join('\n')}
+  return -1;
+}
+`);
+  const result = run(root);
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('私有函数被两处调用时单独计分，原函数不再背它的判断', () => {
+  const root = fixture();
+  write(root, 'backend/legacy.js', `function step(x) {
+  if (x === 1) return 1;
+  return 0;
+}
+export function legacy(x) {
+  step(x);
+  return -1;
+}
+export function other(x) {
+  step(x);
+  return -1;
+}
+`);
+  const result = run(root);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /backend\/legacy\.js#legacy: 记的是 41，实际 1/);
+});
+
 test('基线函数简化后未更新算虚挂', () => {
   const root = fixture();
   write(root, 'backend/legacy.js', branchy('legacy', 10));
