@@ -1,0 +1,119 @@
+[
+  {
+    "name": "现状与基线一致时通过",
+    "findings": {"guard": "g", "scanned": 10, "findings": [
+      {"rule": "r", "key": "a#f", "count": 3},
+      {"rule": "s", "key": "b"}
+    ]},
+    "baseline": {"version": 1, "guard": "g", "entries": {"r": {"a#f": 3}, "s": {"b": 1}}},
+    "expect": {"pass": true, "added": [], "grew": [], "stale": []}
+  },
+  {
+    "name": "没有基线文件时，任何发现都算新增",
+    "findings": {"guard": "g", "scanned": 10, "findings": [{"rule": "r", "key": "a"}]},
+    "baseline": null,
+    "expect": {"pass": false, "added": ["r:a"], "grew": [], "stale": []}
+  },
+  {
+    "name": "没有基线也没有发现时通过",
+    "findings": {"guard": "g", "scanned": 10, "findings": []},
+    "baseline": null,
+    "expect": {"pass": true, "added": [], "grew": [], "stale": []}
+  },
+  {
+    "name": "新 key 算新增",
+    "findings": {"guard": "g", "scanned": 10, "findings": [{"rule": "r", "key": "a"}, {"rule": "r", "key": "new"}]},
+    "baseline": {"version": 1, "guard": "g", "entries": {"r": {"a": 1}}},
+    "expect": {"pass": false, "added": ["r:new"], "grew": [], "stale": []}
+  },
+  {
+    "name": "同一 key 在另一条规则下也算新增",
+    "findings": {"guard": "g", "scanned": 10, "findings": [{"rule": "other", "key": "a"}]},
+    "baseline": {"version": 1, "guard": "g", "entries": {"r": {"a": 1}, "other": {}}},
+    "expect": {"pass": false, "added": ["other:a"], "grew": [], "stale": ["r:a"]}
+  },
+  {
+    "name": "计数上涨算变差",
+    "findings": {"guard": "g", "scanned": 10, "findings": [{"rule": "r", "key": "a", "count": 5}]},
+    "baseline": {"version": 1, "guard": "g", "entries": {"r": {"a": 3}}},
+    "expect": {"pass": false, "added": [], "grew": ["r:a"], "stale": []}
+  },
+  {
+    "name": "计数下降但未更新基线算虚挂",
+    "findings": {"guard": "g", "scanned": 10, "findings": [{"rule": "r", "key": "a", "count": 2}]},
+    "baseline": {"version": 1, "guard": "g", "entries": {"r": {"a": 3}}},
+    "expect": {"pass": false, "added": [], "grew": [], "stale": ["r:a"]}
+  },
+  {
+    "name": "条目消失但未清理算虚挂",
+    "findings": {"guard": "g", "scanned": 10, "findings": []},
+    "baseline": {"version": 1, "guard": "g", "entries": {"r": {"a": 1}}},
+    "expect": {"pass": false, "added": [], "grew": [], "stale": ["r:a"]}
+  },
+  {
+    "name": "同一 rule+key 重复出现时累加",
+    "findings": {"guard": "g", "scanned": 10, "findings": [{"rule": "r", "key": "a"}, {"rule": "r", "key": "a"}]},
+    "baseline": {"version": 1, "guard": "g", "entries": {"r": {"a": 1}}},
+    "expect": {"pass": false, "added": [], "grew": ["r:a"], "stale": []}
+  },
+  {
+    "name": "count 为 0 的发现视为不存在",
+    "findings": {"guard": "g", "scanned": 10, "findings": [{"rule": "r", "key": "a", "count": 0}]},
+    "baseline": {"version": 1, "guard": "g", "entries": {}},
+    "expect": {"pass": true, "added": [], "grew": [], "stale": []}
+  },
+  {
+    "name": "硬规则违规直接失败，即使基线一致",
+    "findings": {"guard": "g", "scanned": 10, "hard": ["t.test.js:3 提交了 .only"], "findings": []},
+    "baseline": {"version": 1, "guard": "g", "entries": {}},
+    "expect": {"pass": false, "added": [], "grew": [], "stale": [], "blocking_count": 1}
+  },
+  {
+    "name": "解析失败直接失败",
+    "findings": {"guard": "g", "scanned": 10, "parse_failures": ["bad.py"], "findings": []},
+    "baseline": {"version": 1, "guard": "g", "entries": {}},
+    "expect": {"pass": false, "added": [], "grew": [], "stale": [], "blocking_count": 1}
+  },
+  {
+    "name": "扫描数低于下限直接失败（防空转通过）",
+    "findings": {"guard": "g", "scanned": 3, "min_scanned": 100, "findings": []},
+    "baseline": {"version": 1, "guard": "g", "entries": {}},
+    "expect": {"pass": false, "added": [], "grew": [], "stale": [], "blocking_count": 1}
+  },
+  {
+    "name": "缺少扫描数直接失败",
+    "findings": {"guard": "g", "findings": []},
+    "baseline": {"version": 1, "guard": "g", "entries": {}},
+    "expect": {"pass": false, "added": [], "grew": [], "stale": [], "blocking_count": 1}
+  },
+  {
+    "name": "基线属于别的守卫时报输入错误",
+    "findings": {"guard": "g", "scanned": 10, "findings": []},
+    "baseline": {"version": 1, "guard": "other", "entries": {}},
+    "expect_error": true
+  },
+  {
+    "name": "基线版本不对时报输入错误",
+    "findings": {"guard": "g", "scanned": 10, "findings": []},
+    "baseline": {"version": 99, "guard": "g", "entries": {}},
+    "expect_error": true
+  },
+  {
+    "name": "发现缺少 key 时报输入错误",
+    "findings": {"guard": "g", "scanned": 10, "findings": [{"rule": "r"}]},
+    "baseline": null,
+    "expect_error": true
+  },
+  {
+    "name": "更新基线：按规则和 key 排序，累加重复，去掉 0，不收硬规则",
+    "mode": "update",
+    "findings": {"guard": "g", "scanned": 10, "hard": ["x"], "findings": [
+      {"rule": "s", "key": "b"},
+      {"rule": "r", "key": "z", "count": 2},
+      {"rule": "r", "key": "a"},
+      {"rule": "r", "key": "a"},
+      {"rule": "t", "key": "gone", "count": 0}
+    ]},
+    "expect_baseline": {"version": 1, "guard": "g", "entries": {"r": {"a": 2, "z": 2}, "s": {"b": 1}}}
+  }
+]
