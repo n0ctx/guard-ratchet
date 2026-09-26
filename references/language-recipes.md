@@ -32,9 +32,9 @@
 - 复杂度：radon（`radon cc -j`）或 lizard；也可以用 `ast` 自己计数。
 - 死代码：vulture（带置信度，建议只取 100% 置信的或自己设门槛）；自研时用 `ast` 建 import 图。
 - 重复：pylint 的 duplicate-code（R0801）或 jscpd。
-- 循环依赖 / 分层：用 `ast` 建 import 图求强连通分量；分层约束可用 import-linter。
+- 循环依赖 / 分层：用 `ast` 建 import 图求强连通分量；分层约束可用 import-linter。`from pkg import sub` 的边落到子模块、不连包入口，见 `guard-catalog.md` 第 7 节。
 - 测试形态：pytest 的 `@pytest.mark.skip`、`pytest.skip()`、`time.sleep(x)`；没有 `assert` 语句也没有 `pytest.raises`/mock 断言的测试函数。
-- N+1：循环或推导式里对 ORM 的逐项查询（Django `Model.objects.get`、SQLAlchemy `session.get/execute`、`cursor.execute`）。
+- N+1：循环或推导式里对 ORM 的逐项查询（Django `Model.objects.get`、SQLAlchemy `session.get/execute`、`cursor.execute`）。`ast.For.iter` 和推导式 `generators[0].iter` 只求值一次，不算循环里，见 `guard-catalog.md` 第 6 节。
 - 约定式加载：`conftest.py`、Django 的 `apps.py`/`admin.py`/`migrations`、`entry_points`、`__init__.py` 的再导出、插件目录。
 
 ## Go

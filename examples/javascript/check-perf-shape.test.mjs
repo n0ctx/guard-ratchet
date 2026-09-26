@@ -50,6 +50,20 @@ test('业务层在循环或数组遍历回调里调用查询层函数失败', ()
   assert.match(result.stderr, /backend\/services\/items\.js#tags#q\.listTags/);
 });
 
+test('循环头的取数来源只求值一次，不算循环内查询', () => {
+  const root = fixture();
+  write(root, 'backend/services/once.js', [
+    "import { reorder } from '../db/queries/t.js';",
+    'export function once(db, ids) {',
+    '  for (const r of reorder(db, ids)) use(r);',
+    '  return reorder(db, ids).map((r) => r.id);',
+    '}',
+    '',
+  ].join('\n'));
+  const result = run(root);
+  assert.equal(result.status, 0, result.stderr);
+});
+
 test('三层循环引用外层变量、新增循环内查询、新增无条件 SELECT 都失败', () => {
   const root = fixture();
   write(root, 'frontend/src/deep.js', [
