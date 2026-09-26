@@ -1,11 +1,10 @@
 # 各语言做法
 
-先看仓库里已经有什么，再从这里挑。表里的工具都需要把输出转换成发现（`rule`、`key`、`count`），再交给棘轮比对——工具自己的「阈值报错」模式不具备基线语义，不要直接用它的退出码当守卫结果。
+仓库已有的工具优先，不够用再从这里挑。这里的工具都要把输出转换成发现（`rule`、`key`、`count`）再交给棘轮比对。工具自带的「超过阈值就报错」模式没有基线语义，不要直接用它的退出码当守卫结果。
 
 引入工具时：
-- 固定版本（锁文件、`requirements` 里的 `==`、`go run pkg@vX`），工具升级改变计数会让基线大面积变动。
-- 引入新依赖前先问用户。
-- 工具的 key 格式（例如行号）不稳定时，在转换层改写成 `路径#符号名` 或内容哈希。
+- 固定版本：锁文件、`requirements` 里的 `==`、`go run pkg@vX`。
+- 工具给的位置标识不稳定（例如带行号）时，在转换层改写成 `路径#符号名` 或内容哈希。
 
 ## 跨语言
 
@@ -25,13 +24,13 @@
 - 循环依赖：madge（`--circular --json`）、dependency-cruiser（还能写分层规则）。
 - 测试形态：自己按 AST 查 `it/test/describe` 调用、`.only`、`expect(`、`setTimeout` 字面量。
 - 约定式加载要留意：Next.js/Nuxt 等文件路由、Vite/ESLint/Vitest 配置文件、`React.lazy(() => import('...'))`、测试辅助的字符串路径加载。
-- 完整参照实现：`examples/javascript/`。
+- 参考实现：`examples/javascript/`。
 
 ## Python
 
 - 解析：标准库 `ast`，无需依赖。
 - 复杂度：radon（`radon cc -j`）或 lizard；也可以用 `ast` 自己计数。
-- 死代码：vulture（带置信度，建议只取 100% 置信的或自己设门槛）；自研时用 `ast` 建 import 图。
+- 死代码：vulture（结果带置信度，默认只取 100% 置信的；要纳入更低置信度，先在当前仓库抽查误报再定门槛）；自研时用 `ast` 建 import 图。
 - 重复：pylint 的 duplicate-code（R0801）或 jscpd。
 - 架构边界：import-linter 可检查分层、禁止导入和 package boundary。
 - 循环依赖：用 `ast` 建 import 图求强连通分量。`from pkg import sub` 的边落到子模块、不连包入口，见 `guard-catalog.md` 第 7 节。
@@ -62,7 +61,7 @@
 - 解析：`syn` crate。
 - 复杂度：clippy 的 `cognitive_complexity` lint，或 lizard。
 - 死代码：编译器的 `dead_code` 警告只管 crate 内私有项；对外 `pub` 的项需要自己按引用图查。
-- 循环依赖：crate 之间 cargo 已禁止；crate 内模块互相引用是允许的，一般不做守卫。
+- 循环依赖：crate 之间 cargo 已禁止；crate 内模块互相引用是允许的，不做守卫。
 - 测试形态：`#[ignore]`、`std::thread::sleep`、没有 `assert!`/`assert_eq!` 的 `#[test]`。
 
 ## C / C++
