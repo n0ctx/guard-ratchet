@@ -10,7 +10,8 @@
 5. 重复代码
 6. 运行形态
 7. 循环依赖
-8. 可选：注释残留、分层方向
+8. 架构边界
+9. 其他可选守卫：注释残留
 
 ---
 
@@ -81,6 +82,12 @@
 
 只看代码形状，不做复杂度标注、不测耗时。
 
+### Effect propagation
+
+把昂贵操作建模为 effect：函数直接执行某种 effect，或调用一个已知带该 effect 的函数，它就具有该 effect。跨函数、跨文件时沿调用和导入关系传播，直到结果稳定。本轮只定义 `db-read`、`db-write`、`network`；JavaScript 参考实现只落实数据库读写。`network` 留作后续方法论，不要求本轮识别 HTTP client。
+
+N+1 是 `db-read` / `db-write` 在重复执行上下文中的一种形态。查询层函数必须有证据表明其确实访问数据库，不能因文件位于 query 目录就算 effect；现有 `loop-query`、`perf-shape` 规则名和行为继续兼容。
+
 | 规则 | 类型 | 说明 |
 |---|---|---|
 | 循环里逐项查询（N+1） | 集合型基线 | 在循环体或 `map`/`filter`/列表推导等逐项回调里：调用 `prepare`/`execute`、调用 prepared statement 的 `get`/`all`/`run`、**调用从查询层导入、且确实访问数据库的函数**、ORM 的逐项 `find`/`get`。key 为 `路径#函数#被调名` |
@@ -101,10 +108,40 @@
 - **边要落到真正依赖的模块**：Python 的 `from pkg import sub` 在 `sub` 是子模块时，边只连到 `pkg.sub`，不要再连一条到 `pkg`（`__init__`）——加载子模块不依赖包入口里定义的名字。多连这条边，每个「包入口再导出子模块、子模块又 `from . import 兄弟`」的包都会被报成环。导入的名字不是子模块（包入口里定义的函数、常量）时，照旧连到包；`import *` 也连到包。
 - **跳过**：语言本身禁止循环依赖时（Go 的包导入）。
 
-## 8. 可选守卫
+## 8. 架构边界
+
+架构规则复用静态 import graph，用 `source path → target path` 判断禁止方向。只在仓库已有可验证的目录或模块边界时启用；现状为零的清晰违规适合做硬规则，有合理存量时记入基线。
+
+### 8.1 Forbidden dependency
+
+含义是 A 不允许依赖 B，例如 `domain → infrastructure`、`frontend → database`、`route → query`、`feature-a → feature-b/internal`。按 `from` 路径和目标路径匹配依赖边；finding key 用 `source-module → target-module`，同一模块对只报一次，不用行号。
+
+典型规则是零违规时做硬规则；有合理存量时按模块对设基线。
+
+### 8.2 Allowed dependencies
+
+某个架构区域只允许依赖列出的区域，例如 `domain` 只能依赖 `domain` 与 `shared`。只在仓库已有清晰分区时配置；不要要求每个项目都建立区域表。
+
+### 8.3 Required path
+
+表达简单的架构意图，例如 route 必须经过 service 才能使用 query。静态规则只实现 `route → query` 禁止，不做数据流或多跳路径分析。
+
+### 8.4 Module encapsulation
+
+仅在仓库已有明确模块入口约定时启用。
+
+- `cross-module-deep-import`：跨模块只许导入模块公开入口；例如 `features/order → features/user/index.js`，不许直接导入 `features/user/src/view.js`。
+- `internal-api-import`：按仓库约定禁止跨模块访问 `internal/`、`private/` 等明确私有目录。公开入口位置和私有路径必须来自实际目录约定。
+
+不得仅凭文件名猜完整模块边界。可以允许 `features/order → features/user` 或 `features/user/index.js`，同时禁止 `features/user/internal/cache.js`。Finding key 仍是稳定的模块对。
+
+### 8.5 Containment
+
+边界定义足够完整时，可检查正式业务模块是否都属于某个已声明区域；遗漏时报告 `architecture-unclassified`。默认不启用，避免把工具、示例或特殊目录误判成业务模块。它用于发现通过新增 `misc/`、`temp-core/` 一类目录绕开现有边界的情况。
+
+## 9. 其他可选守卫
 
 - **注释残留**：注释里的 TODO/FIXME/HACK、描述修改历史的词（「之前」「改为」「兼容旧版」「临时」、legacy、deprecated）。计数型基线，key 为文件。关键词表要先人工过一遍，业务含义的「之前」会误报。
-- **分层方向**：例如「路由不许绕过服务层直接调查询层」「前端只能经 api 模块发请求」「领域层不许依赖框架」。用引用图检查 `from 目录 → to 目录` 的禁止组合；现状为 0 时做硬规则。先确认仓库是否已有 lint 规则在管。
 
 ## 不建议做成守卫的
 

@@ -13,6 +13,7 @@
  *   mod['a']                                  → a
  *   mod[suite.createName]                     → 本文件里所有 `createName: '…'` 属性的字符串值
  * 模块对象被传给函数、展开、或下标取不到对应属性值时，按全部导出都用到处理。
+ * bare package specifier 按外部依赖处理；仓库若使用路径别名，落地前必须按仓库约定补充解析。
  */
 
 import path from 'node:path';
@@ -147,47 +148,70 @@ function rootImportTargets(tree, arg) {
 function moduleShape(rel, tree) {
   const refs = [];
   const exports = [];
-  const ref = (base, names, lazy = false) => refs.push({ base, names, lazy });
+  const ref = (base, names, lazy = false, specifier = base) => refs.push({ base, names, lazy, specifier });
   const exported = (node, names) => names.forEach((name) => exports.push({ name, line: node.loc.start.line }));
   const parents = parentMap(tree);
   for (const [node] of walk(tree)) {
-    if (node.type === 'ImportDeclaration') ref(relative(rel, node.source.value), importNames(node));
+    if (node.type === 'ImportDeclaration') {
+      const specifier = node.source.value;
+      ref(relative(rel, specifier), importNames(node), false, specifier);
+    }
     else if (node.type === 'ExportNamedDeclaration') {
       if (node.declaration) exported(node, declarationNames(node.declaration));
       exported(node, node.specifiers.map((s) => moduleName(s.exported)));
-      if (node.source) ref(relative(rel, node.source.value), node.specifiers.map((s) => moduleName(s.local)));
+      if (node.source) {
+        const specifier = node.source.value;
+        ref(relative(rel, specifier), node.specifiers.map((s) => moduleName(s.local)), false, specifier);
+      }
     } else if (node.type === 'ExportAllDeclaration') {
-      ref(relative(rel, node.source.value), [ALL]);
+      const specifier = node.source.value;
+      ref(relative(rel, specifier), [ALL], false, specifier);
       if (node.exported) exported(node, [moduleName(node.exported)]);
     } else if (node.type === 'ExportDefaultDeclaration') exported(node, ['default']);
     else if (node.type === 'ImportExpression') {
       const literal = stringValue(node.source);
       const names = loadedNames(tree, parents, node);
-      if (literal !== null) ref(relative(rel, literal), names, true);
-      else embeddedPaths(node.source).forEach((base) => ref(base, names, true));
+      if (literal !== null) ref(relative(rel, literal), names, true, literal);
+      else embeddedPaths(node.source).forEach((base) => ref(base, names, true, base));
     } else if (node.type === 'CallExpression' && node.callee.type === 'Identifier' && node.arguments.length === 1) {
-      if (node.callee.name === 'require') ref(relative(rel, stringValue(node.arguments[0])), [ALL]);
+      if (node.callee.name === 'require') {
+        const specifier = stringValue(node.arguments[0]);
+        ref(relative(rel, specifier), [ALL], false, specifier);
+      }
       else if (ROOT_IMPORTERS.has(node.callee.name)) {
         const names = loadedNames(tree, parents, node);
-        rootImportTargets(tree, node.arguments[0]).forEach((base) => ref(base, names, true));
+        rootImportTargets(tree, node.arguments[0]).forEach((base) => ref(base, names, true, base));
       }
     }
   }
   return { refs, exports };
 }
 
-// 返回 { fileSet, parsed, parseFailures, modules: Map<rel, { exports: [{ name, line }], refs: [{ target, names, lazy }] }> }
-export function buildImportGraph(root, rels) {
+// 返回已解析模块和 unresolvedStaticImports；后者列出无法解析的确定性仓内引用。
+// scan 可传入同一批文件的 parseFiles 结果，供已有 detector 复用解析结果。
+export function buildImportGraph(root, rels, scan = null) {
   const fileSet = new Set(rels);
-  const { parsed, parseFailures } = parseFiles(root, rels);
+  const { parsed, parseFailures } = scan ?? parseFiles(root, rels);
   const modules = new Map();
+  const unresolvedStaticImports = [];
   for (const { rel, tree } of parsed) {
     const { refs, exports } = moduleShape(rel, tree);
-    const resolved = refs
-      .map(({ base, names, lazy }) => ({ target: base && resolveFile(fileSet, base), names, lazy }))
-      .filter(({ target }) => target && target !== rel);
+    const resolved = [];
+    for (const { base, names, lazy, specifier } of refs) {
+      const target = base && resolveFile(fileSet, base);
+      if (!target) {
+        if (base !== null) unresolvedStaticImports.push({ source: rel, target: base, specifier, lazy });
+        continue;
+      }
+      if (target !== rel) resolved.push({ target, names, lazy });
+    }
     const seen = new Set();
     modules.set(rel, { exports: exports.filter((e) => !seen.has(e.name) && seen.add(e.name)), refs: resolved });
   }
-  return { fileSet, parsed, parseFailures, modules };
+  unresolvedStaticImports.sort((a, b) => {
+    const left = `${a.source}\0${a.target}\0${a.specifier}`;
+    const right = `${b.source}\0${b.target}\0${b.specifier}`;
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+  return { fileSet, parsed, parseFailures, modules, unresolvedStaticImports };
 }

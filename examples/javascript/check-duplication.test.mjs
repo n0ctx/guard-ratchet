@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import { useGuardFixture } from './guard-fixture.mjs';
 
-const { makeRoot, write, run } = useGuardFixture('check-duplication.mjs');
+const { makeRoot, write, read, run } = useGuardFixture('check-duplication.mjs');
 
 const block = (name) => `export function ${name}(items) {
   let total = 0;
@@ -44,6 +44,46 @@ test('基线里的重复消失后未清理算虚挂', () => {
   const result = run(root);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /基线与现状对不上/);
+});
+
+test('插入无关注释不改变重复 key', () => {
+  const root = fixture();
+  write(root, 'backend/a.js', `// unrelated comment\n${block('sumA')}`);
+  const result = run(root);
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('重复片段 39 token 不报，达到 40 token 才报', () => {
+  const root = fixture();
+  const declarations = (prefix, count) => Array.from(
+    { length: count }, (_, i) => `const ${prefix}${i} = 1;`,
+  ).join('\n');
+  write(root, 'frontend/src/edge-a.js', `${declarations('a', 7)}\n`);
+  write(root, 'frontend/src/edge-b.js', `${declarations('b', 7)}\n`);
+  assert.equal(run(root).status, 0);
+
+  write(root, 'frontend/src/edge-a.js', `${declarations('a', 8)}\n`);
+  write(root, 'frontend/src/edge-b.js', `${declarations('b', 8)}\n`);
+  const result = run(root);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /edge-a\.js:1-8、frontend\/src\/edge-b\.js:1-8/);
+});
+
+test('解析失败和空扫描都失败，且无效扫描不能更新基线', () => {
+  const root = fixture();
+  const before = read(root, 'scripts/duplication-baseline.json');
+  write(root, 'frontend/src/bad.js', 'export const = ;\n');
+  const parseFailure = run(root);
+  assert.equal(parseFailure.status, 1);
+  assert.match(parseFailure.stderr, /解析失败：frontend\/src\/bad\.js/);
+
+  const update = run(root, '--update-baseline');
+  assert.equal(update.status, 1);
+  assert.equal(read(root, 'scripts/duplication-baseline.json'), before);
+
+  const empty = run(makeRoot());
+  assert.equal(empty.status, 1);
+  assert.match(empty.stderr, /没有扫到任何文件/);
 });
 
 const setters = (source) => ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta']

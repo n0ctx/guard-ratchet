@@ -1,6 +1,6 @@
 ---
 name: guard-ratchet
-description: 在任意仓库落地「只许变好」的源码守卫（基线棘轮）：圈复杂度、文件/函数体量、测试形态（无断言、.only、长 sleep、永久 skip）、死代码（无引用文件/导出）、重复代码、运行形态（循环里逐条查库、深层嵌套循环、无条件 SELECT）、循环依赖。现有问题记进基线不改业务代码，新增违规、变差、基线虚挂都让 lint/CI 失败。只要用户想给仓库加代码质量门禁、防止复杂度/重复/死代码回潮、「新代码不许更差、旧债只许还」、给 lint 链加检查脚本、设计 baseline / ratchet / code health gate / quality gate / fitness function，或者想把某类代码问题变成自动检查——即使没说「守卫」或「基线」——都应使用本 skill。不用于：一次性清理或重构现有代码、跑测试、修单个 lint 报错、只想要一份代码审查意见。
+description: 在任意仓库落地「只许变好」的源码守卫（基线棘轮）：圈复杂度、文件/函数体量、测试形态（无断言、.only、长 sleep、永久 skip）、死代码（无引用文件/导出）、重复代码、运行形态（循环里逐条查库、深层嵌套循环、无条件 SELECT）、循环依赖、架构边界（禁止层间依赖、跨模块 internal/deep import）。现有问题记进基线不改业务代码，新增违规、变差、基线虚挂都让 lint/CI 失败。只要用户想给仓库加代码质量门禁、防止复杂度/重复/死代码回潮、「新代码不许更差、旧债只许还」、给 lint 链加检查脚本、设计 baseline / ratchet / code health gate / quality gate / fitness function，或者想把某类代码问题变成自动检查——即使没说「守卫」或「基线」——都应使用本 skill。不用于：一次性清理或重构现有代码、跑测试、修单个 lint 报错、只想要一份代码审查意见。
 ---
 
 # 基线棘轮守卫
@@ -16,7 +16,7 @@ description: 在任意仓库落地「只许变好」的源码守卫（基线棘�
 | 棘轮 | 发现与基线怎么比、什么算失败、基线怎么更新 | 不变。规格见 `references/contract.md`，参考实现 `scripts/ratchet.py`，一致性用例 `conformance/cases.json` |
 | 检测器 | 在这个仓库里找出「发现」 | 随语言、架构、约定而变。由你在当前仓库挑选或编写 |
 
-检测器只负责输出发现（规则、稳定的位置标识、计数）；比对逻辑必须符合契约。检测器可以是仓库已有工具的输出转换、成熟的现成工具，或者自己写的 AST 脚本。
+检测器只负责输出发现（规则、稳定的位置标识、计数）；比对逻辑必须符合 Ratchet Contract。自研检测器还必须满足 `references/detector-contract.md`，证明扫描范围、覆盖量、key 和失败行为可信。
 
 棘轮优先直接复用：仓库的开发和 CI 环境里已经有 Python 3 时，把 `scripts/ratchet.py` 拷进仓库，检测器输出 JSON 交给它比对即可，它已经通过一致性用例，不需要再写一遍。只有环境里没有 Python、或团队明确不想引入第二种语言时，才在仓库主语言里重写棘轮，并跑通 `conformance/cases.json`。重写棘轮是整个落地过程中最费时的部分，别在不必要时做。
 
@@ -26,7 +26,8 @@ description: 在任意仓库落地「只许变好」的源码守卫（基线棘�
 - 开始时：本文件 + `references/pitfalls.md`
 - 第 2 步：`references/guard-catalog.md` 里被选中守卫的那几节
 - 第 3 步：`references/language-recipes.md` 里当前语言那一节
-- 第 4 步：`references/contract.md`；仓库是 JavaScript/TypeScript 且要自研检测器时，再看 `examples/javascript/`
+- 实现检测器前：`references/detector-contract.md` + `references/contract.md`
+- 仓库是 JavaScript/TypeScript 且要自研检测器时：再看 `examples/javascript/`
 
 ## 工作流程
 
@@ -65,13 +66,33 @@ description: 在任意仓库落地「只许变好」的源码守卫（基线棘�
 
 引入新依赖前先问用户，除非用户已经允许。
 
-### 4. 实现
+### 4. 定义 detector invariants
 
-每个守卫都要满足 `references/contract.md` 里的命令行约定：`--update-baseline` 重写基线、默认只检查、退出码 0/1/2，以及用于测试的 `--root` 之类参数。尽量让每个守卫在几秒内跑完——它会进入每次 lint。
+写 detector 之前先明确并记录：
+- 扫描范围和排除项；正式代码与测试、生成代码、第三方代码如何区分
+- 覆盖指标、最低覆盖要求，以及哪些未知项会让 detector health 失败
+- 稳定 key 的组成方式
+- 已知不支持的情况，并区分静态分析本来无法确定的输入与确定性输入处理失败
+
+实现 detector 前必须阅读 `references/detector-contract.md` 和 `references/contract.md`。不要等测试阶段才考虑 detector 是否可能空转。
+
+### 5. 实现 detector
+
+实现 detector 时同时实现 health / coverage 检查：文件发现数、解析成功数、关键实体数、无法处理的确定性输入都要能核对；无效扫描不得报成 0 finding，也不得写基线。每个守卫都要满足 `references/contract.md` 里的命令行约定：`--update-baseline` 重写基线、默认只检查、退出码 0/1/2，以及用于测试的 `--root` 之类参数。尽量让每个守卫在几秒内跑完——它会进入每次 lint。
 
 位置标识（key）的设计是基线稳定的关键：用「路径#符号名」或规范化后的内容指纹，**不要用行号**，否则任何无关的插行都会让整份基线失效。同名冲突用 `~2`、`~3` 这类稳定后缀区分。
 
-### 5. 生成基线
+### 6. 分层验证 detector 与 ratchet
+
+两层验证不能混在一起：
+
+**Detector correctness**：夹具证明正例、反例、门槛边界、稳定 key、解析失败和覆盖失败。自研 detector 都要覆盖这些行为；成熟外部工具测试输出转换、key 归一化、覆盖检查和失败传播。
+
+**Ratchet correctness**：夹具证明当前与基线一致时通过、新增发现失败、改善或消失但基线未收紧时 stale / 失败。硬规则不需要与基线有关的用例。
+
+测试可以合并这些行为，不要求每个测试文件机械地正好有九个 `test()`。
+
+### 7. 生成基线
 
 - 用当前代码生成基线；**不要为了让守卫通过去改业务代码**。现有违规记录下来就是基线存在的意义。
 - 如果工作区里有别人未提交的改动，从干净的提交快照生成基线（例如 `git archive HEAD` 解到临时目录，再拷入自己本次改动的文件），避免把别人的半成品记进基线。
@@ -79,7 +100,7 @@ description: 在任意仓库落地「只许变好」的源码守卫（基线棘�
 
 **不碰别人的工作区状态。** 生成基线和做验证时，需要「去掉别人的改动」或「注入一条违规」的场景，一律在临时副本里做（`git archive` 解压、`cp -R` 或 `git worktree add`）。不要用 `git stash`、`git checkout --`、`git reset` 临时挪走别人的改动再恢复——中途出错或被打断，别人的工作就丢了。
 
-### 6. 接入
+### 8. 接入
 
 挂进仓库原有的 lint 或 CI 链，放在同类检查旁边。给每个守卫一个一致的命令名（例如 `check:duplication`），在脚本头部注释里写清：查什么、为什么、怎么更新基线。
 
@@ -87,18 +108,13 @@ description: 在任意仓库落地「只许变好」的源码守卫（基线棘�
 
 最后把统一入口写进仓库给 agent 看的说明文件（`AGENTS.md`、`CLAUDE.md`、`CONTRIBUTING.md` 等），写明：守卫有哪些、统一入口是什么、报「基线虚挂」时怎么更新基线。这样以后的会话一句「跑一下守卫」就知道做什么。写之前先确认该文件是否被版本控制忽略（`git check-ignore <文件>`）：被忽略的文件只在本机生效，别人克隆后看不到——这种情况下写进受版本控制的文件，或者告诉用户。
 
-### 7. 验证
+### 9. 真实仓库验证
 
-每个守卫都要有夹具测试：在临时目录搭一个小仓库，覆盖三种结果：
-1. 现状与基线一致 → 通过
-2. 新增一条违规 → 失败，并且报出的是这一条
-3. 修好一条基线里的违规但没更新基线 → 失败（虚挂）
+把 detector correctness 和 ratchet correctness 的夹具测试接进 lint，否则守卫坏了没人知道。测试共用一个小辅助（建临时目录、写文件、运行守卫），不要每个测试文件各写一遍。
 
-硬规则只需要前两种。把这些测试也接进 lint，否则守卫坏了没人知道。夹具测试共用一个小辅助（建临时目录、写文件、运行守卫），不要每个测试文件各写一遍。
+在真实仓库上直接运行每个守卫，确认扫描覆盖完整且退出 0；如果棘轮是自己实现的，跑一遍 `conformance/cases.json`。想在真实代码上演示「注入违规会失败」时，同样在副本里做。
 
-然后在真实仓库上直接运行每个守卫，确认退出 0；如果棘轮是自己实现的，跑一遍 `conformance/cases.json`。想在真实代码上演示「注入违规会失败」时，同样在副本里做。
-
-### 8. 汇报
+### 10. 汇报
 
 向用户说明：
 - 加了哪些守卫、各自的命令、哪些是硬规则
@@ -112,8 +128,9 @@ description: 在任意仓库落地「只许变好」的源码守卫（基线棘�
 ## 参考文件
 
 - `references/contract.md` — 棘轮语义、发现与基线格式、命令行约定。实现或移植棘轮前必读
+- `references/detector-contract.md` — 自研检测器的确定性、失败关闭、覆盖、key、未知项、夹具与范围要求
 - `references/guard-catalog.md` — 每种守卫的目的、信号、key 设计、默认门槛、常见误报
 - `references/language-recipes.md` — 各语言可用的解析器和现成工具
 - `references/pitfalls.md` — 落地时的坑
 - `scripts/ratchet.py` — 棘轮参考实现（Python 标准库，无依赖）；`python3 scripts/ratchet.py conformance` 运行一致性用例
-- `examples/javascript/` — 一套落地过的 JavaScript 实现（espree 解析、6 个守卫、夹具测试），写自研检测器时参照；其中的扫描目录和约定属于原仓库，先读它的 README
+- `examples/javascript/` — 六个既有 JavaScript 守卫与一个最小架构边界参考实现（espree 解析、夹具测试）；写自研检测器时参照，其中的扫描目录和约定属于原仓库，先读它的 README

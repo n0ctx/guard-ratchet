@@ -97,12 +97,14 @@ function collectEntries(root, rels, fileSet) {
 // ─── 汇总 ────────────────────────────────────────────────────────────────────
 function collectDeadCode(root) {
   const rels = collectCodeFiles(root);
-  const { fileSet, parsed, parseFailures, modules } = buildImportGraph(root, rels);
+  const { fileSet, parsed, parseFailures, modules, unresolvedStaticImports } = buildImportGraph(root, rels);
   const allow = collectAllowMarkers(parsed, 'dead-code');
   const referencedBy = new Map();
   const usedNames = new Map();
+  const edges = new Set();
   for (const [rel, { refs }] of modules) {
     for (const { target, names } of refs) {
+      edges.add(`${rel} -> ${target}`);
       if (!referencedBy.has(target)) referencedBy.set(target, new Set());
       referencedBy.get(target).add(rel);
       if (!usedNames.has(target)) usedNames.set(target, new Set());
@@ -121,24 +123,40 @@ function collectDeadCode(root) {
       .filter(({ name, line }) => !used.has(name) && !allow.covers(rel, line))
       .map(({ name }) => `${rel}#${name}`));
   }
-  return { files, exports: exports.sort(), allow, parseFailures, fileCount: rels.length };
+  return {
+    files, exports: exports.sort(), allow, parseFailures, unresolvedStaticImports,
+    fileCount: rels.length, parsedFileCount: parsed.length, moduleCount: modules.size, edgeCount: edges.size,
+  };
 }
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 function main() {
   const args = parseArgs(process.argv.slice(2), DEFAULT_BASELINE);
-  const { files, exports, allow, parseFailures, fileCount } = collectDeadCode(args.root);
+  const { files, exports, allow, parseFailures, unresolvedStaticImports, fileCount, parsedFileCount, moduleCount, edgeCount }
+    = collectDeadCode(args.root);
 
-  if (args.updateBaseline && !parseFailures.length) {
+  const summary = `解析 ${parsedFileCount}/${fileCount} 个文件，${moduleCount} 个模块 / ${edgeCount} 条引用边，`
+    + `无引用文件 ${files.length} 个、无引用导出 ${exports.length} 个`;
+  const healthFailures = [];
+  if (fileCount === 0) healthFailures.push('没有扫到任何文件，遍历逻辑可能坏了');
+  if (parsedFileCount !== fileCount) healthFailures.push(`解析覆盖不完整：计划 ${fileCount} 个文件，成功解析 ${parsedFileCount} 个`);
+  if (moduleCount !== parsedFileCount) healthFailures.push(`依赖图构建不完整：已解析 ${parsedFileCount} 个文件，仅构建 ${moduleCount} 个模块`);
+  for (const rel of parseFailures) healthFailures.push(`解析失败：${rel}（espree 无法解析，请检查语法）`);
+  for (const ref of unresolvedStaticImports) {
+    healthFailures.push(`无法解析仓内静态引用：${ref.source} -> ${ref.specifier}（目标 ${ref.target}）`);
+  }
+
+  if (args.updateBaseline && healthFailures.length) {
+    finish('死代码守卫', ['detector health 不通过', ...healthFailures], summary);
+  }
+  if (args.updateBaseline) {
     writeBaseline(args.baselinePath, { files, exports });
     console.log(`[dead-code] 基线已更新\nFile: ${path.relative(args.root, args.baselinePath)}\n`
-      + `文件: ${fileCount}（无引用文件 ${files.length} 个、无引用导出 ${exports.length} 个写入基线）`);
+      + `${summary} 写入基线`);
     process.exit(0);
   }
 
-  const failures = [];
-  if (fileCount === 0) failures.push('没有扫到任何文件，遍历逻辑可能坏了');
-  for (const rel of parseFailures) failures.push(`解析失败：${rel}（espree 无法解析，请检查语法）`);
+  const failures = [...healthFailures];
 
   let baseline;
   try {
@@ -154,8 +172,7 @@ function main() {
   }));
   failures.push(...allowFailures(allow));
 
-  finish('死代码守卫', failures,
-    `${fileCount} 个文件，无引用文件 ${files.length} 个、无引用导出 ${exports.length} 个`, BASELINE_NOTE, allow.listing());
+  finish('死代码守卫', failures, summary, BASELINE_NOTE, allow.listing());
 }
 
 main();

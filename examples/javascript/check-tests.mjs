@@ -37,6 +37,7 @@ const SCRIPT = 'check-tests.mjs';
 const DEFAULT_BASELINE = path.join('scripts', 'test-shape-baseline.json');
 const SCAN_DIRS = ['backend/tests', 'assistant/tests', 'frontend'];
 const TEST_FILE_RE = /\.(test\.(js|jsx|mjs)|spec\.[^./]+)$/;
+const MIN_TEST_CASE_COUNT = 1;
 const E2E_DIR = 'backend/tests/e2e/';
 const BACKEND_TEST_SCRIPTS = ['test', 'test:coverage'];
 const MAX_DELAY_MS = 50;
@@ -218,9 +219,15 @@ function recordShape(file, call, found) {
 
 function inspectFile(file, found) {
   found.assertNames = assertLocals(file.tree);
-  for (const [node] of walk(file.tree)) {
+  for (const [node, parent] of walk(file.tree)) {
     checkPlaywright(file, node, found);
     if (node.type !== 'CallExpression') continue;
+    const info = testCall(node);
+    const isHook = info && ['before', 'after', 'beforeEach', 'afterEach'].includes(info.modifier);
+    if (info && TEST_NAMES.has(info.root) && !isHook
+        && !(parent?.type === 'CallExpression' && parent.callee === node)) {
+      found.testCases += 1;
+    }
     checkAssertions(file, node, found);
     checkFocusAndTrivial(file, node, found);
     checkDelays(file, node, found);
@@ -265,7 +272,7 @@ function collectTestShape(root) {
     .filter((rel) => TEST_FILE_RE.test(rel));
   const { parsed, parseFailures } = parseFiles(root, rels);
   const allow = collectAllowMarkers(parsed, 'tests');
-  const found = { hard: checkBackendScripts(root), heavy: [], skips: [], allow };
+  const found = { hard: checkBackendScripts(root), heavy: [], skips: [], testCases: 0, allow };
   for (const file of parsed) inspectFile(file, found);
   return {
     allow,
@@ -274,6 +281,8 @@ function collectTestShape(root) {
     skips: suffixDuplicates(found.skips),
     parseFailures,
     fileCount: rels.length,
+    parsedFileCount: parsed.length,
+    testCases: found.testCases,
   };
 }
 
@@ -282,24 +291,35 @@ function main() {
   const args = parseArgs(process.argv.slice(2), DEFAULT_BASELINE);
   const shape = collectTestShape(args.root);
   const heavyOver = Object.fromEntries(Object.entries(shape.heavySetup).filter(([, n]) => n > 1).sort());
+  const summary = `解析 ${shape.parsedFileCount}/${shape.fileCount} 个测试文件，识别 ${shape.testCases} 个测试用例`;
+  const healthFailures = [];
+  if (shape.fileCount === 0) healthFailures.push('没有扫到任何测试文件，遍历逻辑可能坏了');
+  if (shape.parsedFileCount !== shape.fileCount) {
+    healthFailures.push(`解析覆盖不完整：计划 ${shape.fileCount} 个文件，成功解析 ${shape.parsedFileCount} 个`);
+  }
+  if (shape.testCases < MIN_TEST_CASE_COUNT) {
+    healthFailures.push(`识别到的测试用例过少（${shape.testCases} < ${MIN_TEST_CASE_COUNT}），测试扫描可能失效`);
+  }
+  for (const rel of shape.parseFailures) healthFailures.push(`解析失败：${rel}（espree 无法解析，请检查语法）`);
 
-  if (args.updateBaseline && !shape.parseFailures.length) {
+  if (args.updateBaseline && healthFailures.length) {
+    finish('测试形态守卫', ['detector health 不通过', ...healthFailures], summary);
+  }
+  if (args.updateBaseline) {
     writeBaseline(args.baselinePath, { heavySetup: heavyOver, skips: shape.skips });
     console.log(`[tests] 基线已更新\nFile: ${path.relative(args.root, args.baselinePath)}\n`
-      + `测试文件: ${shape.fileCount}（重复起服务/建库 ${Object.keys(heavyOver).length} 处、跳过 ${shape.skips.length} 条写入基线）`);
+      + `${summary}（重复起服务/建库 ${Object.keys(heavyOver).length} 处、跳过 ${shape.skips.length} 条写入基线）`);
     process.exit(0);
   }
 
-  const failures = [];
-  if (shape.fileCount === 0) failures.push('没有扫到任何测试文件，遍历逻辑可能坏了');
-  for (const rel of shape.parseFailures) failures.push(`解析失败：${rel}（espree 无法解析，请检查语法）`);
+  const failures = [...healthFailures];
   if (shape.hard.length) failures.push(section('测试形态违规（不进基线，必须改掉）：', shape.hard));
 
   let baseline;
   try {
     baseline = loadBaseline(args.baselinePath, { heavySetup: {}, skips: [] });
   } catch (err) {
-    finish('测试形态守卫', [err.message], `扫描 ${shape.fileCount} 个测试文件`);
+    finish('测试形态守卫', [err.message], summary);
   }
   failures.push(...baselineFailures(compareCounts(shape.heavySetup, baseline.heavySetup || {}, { allowed: 1 }), {
     script: SCRIPT, addedTitle: `这些测试文件里 ${HEAVY_SETUP.join(' / ')} 超过 1 次，而且不在基线里；共用一次启动`,
@@ -309,7 +329,7 @@ function main() {
   }));
   failures.push(...allowFailures(shape.allow));
 
-  finish('测试形态守卫', failures, `${shape.fileCount} 个测试文件`, BASELINE_NOTE, shape.allow.listing());
+  finish('测试形态守卫', failures, summary, BASELINE_NOTE, shape.allow.listing());
 }
 
 main();

@@ -25,6 +25,15 @@ test('现状与基线一致时通过', () => {
   assert.equal(result.status, 0, result.stderr);
 });
 
+test('复杂度等于门槛不报，超过门槛才报', () => {
+  const root = fixture();
+  write(root, 'backend/boundary.js', branchy('atLimit', 29) + branchy('aboveLimit', 30));
+  const result = run(root);
+  assert.equal(result.status, 1);
+  assert.doesNotMatch(result.stderr, /boundary\.js#atLimit/);
+  assert.match(result.stderr, /boundary\.js#aboveLimit: 31/);
+});
+
 test('新增超标函数或基线函数变复杂都失败', () => {
   const root = fixture();
   write(root, 'backend/fresh.js', branchy('fresh', 31));
@@ -78,6 +87,25 @@ test('基线函数简化后未更新算虚挂', () => {
   const result = run(root);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /backend\/legacy\.js#legacy: 记的是 41，实际 11/);
+});
+
+test('解析失败和低于函数覆盖下限时失败，且不能写基线', () => {
+  const root = fixture();
+  const baselinePath = path.join(root, 'scripts/complexity-baseline.json');
+  const baselineBefore = readFileSync(baselinePath, 'utf8');
+  write(root, 'backend/bad.js', 'export const = ;\n');
+  const parseFailure = run(root);
+  assert.equal(parseFailure.status, 1);
+  assert.match(parseFailure.stderr, /解析失败：backend\/bad\.js/);
+
+  const update = run(root, '--update-baseline');
+  assert.equal(update.status, 1);
+  assert.match(update.stderr, /detector health 不通过/);
+  assert.equal(readFileSync(baselinePath, 'utf8'), baselineBefore);
+
+  const empty = run(makeRoot());
+  assert.equal(empty.status, 1);
+  assert.match(empty.stderr, /扫到的函数过少/);
 });
 
 test('匿名函数按「外层函数名>调用名」命名，前面多一个函数不会让 key 错位', () => {

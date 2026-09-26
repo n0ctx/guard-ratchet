@@ -72,6 +72,21 @@ test('提交 .only 或写死结果的断言失败', () => {
   assert.equal(result.stderr.match(/b\.test\.js:4 断言只比较字面量/g).length, 3);
 });
 
+test('固定等待等于 50ms 不报，超过上限才报', () => {
+  const root = fixture();
+  const source = (ms) => [
+    "import { test } from 'node:test';",
+    `test('wait', async () => { await new Promise((resolve) => setTimeout(resolve, ${ms})); expect(view()).toBe(1); });`,
+    '',
+  ].join('\n');
+  write(root, 'frontend/src/boundary.test.js', source(50));
+  assert.equal(run(root).status, 0);
+  write(root, 'frontend/src/boundary.test.js', source(51));
+  const result = run(root);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /setTimeout 延迟 51ms/);
+});
+
 test('基线里的跳过删掉后未清理算虚挂', () => {
   const root = fixture();
   write(root, 'backend/tests/a.test.js', "import assert from 'node:assert';\ntest('ok', () => { assert.ok(ready()); });\n");
@@ -79,6 +94,44 @@ test('基线里的跳过删掉后未清理算虚挂', () => {
   assert.equal(result.status, 1);
   assert.match(result.stderr, /基线与现状对不上[\s\S]*a\.test\.js#test\.skip pending/);
   assert.match(result.stderr, /a\.test\.js#listen: 记的是 2，实际 0/);
+});
+
+test('在跳过用例前增加无关测试，不改变已有跳过 key', () => {
+  const root = fixture();
+  write(root, 'backend/tests/a.test.js', [
+    "import assert from 'node:assert/strict';",
+    "test('unrelated', () => { assert.ok(ready()); });",
+    "test.skip('pending', () => {});",
+    'server.listen(0); server.listen(0);',
+    '',
+  ].join('\n'));
+  const result = run(root);
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('解析失败或没有测试文件时 detector health 失败，不能更新基线', () => {
+  const root = fixture();
+  write(root, 'backend/tests/bad.test.js', 'test(,);\n');
+  const parseFailure = run(root);
+  assert.equal(parseFailure.status, 1);
+  assert.match(parseFailure.stderr, /解析失败：backend\/tests\/bad\.test\.js/);
+
+  const update = run(root, '--update-baseline');
+  assert.equal(update.status, 1);
+  assert.match(update.stderr, /detector health 不通过/);
+
+  const empty = run(makeRoot());
+  assert.equal(empty.status, 1);
+  assert.match(empty.stderr, /没有扫到任何测试文件/);
+
+  const noCases = makeRoot();
+  write(noCases, 'backend/package.json', JSON.stringify({
+    scripts: { test: `node --test ${GLOB}`, 'test:coverage': `node --test ${GLOB}` },
+  }));
+  write(noCases, 'backend/tests/helper.test.js', 'export const helper = 1;\n');
+  const coverageFailure = run(noCases);
+  assert.equal(coverageFailure.status, 1);
+  assert.match(coverageFailure.stderr, /识别到的测试用例过少/);
 });
 
 test('listen 后在同一函数里 close 的端口探测不算启动，guard-allow 标记的调用不计数', () => {

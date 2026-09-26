@@ -4,7 +4,7 @@
 
 import { after } from 'node:test';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,6 +23,9 @@ export function useGuardFixture(scriptName) {
     write(root, rel, text) {
       mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
       writeFileSync(path.join(root, rel), text);
+    },
+    read(root, rel) {
+      return readFileSync(path.join(root, rel), 'utf8');
     },
     run(root, ...args) {
       return spawnSync(process.execPath, [path.join(SCRIPTS_DIR, scriptName), '--root', root, ...args], { encoding: 'utf8' });

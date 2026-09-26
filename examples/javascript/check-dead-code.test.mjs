@@ -47,6 +47,13 @@ test('基线里的无引用导出删掉后未清理算虚挂', () => {
   assert.match(result.stderr, /基线与现状对不上[\s\S]*backend\/lib\.js#unused/);
 });
 
+test('在导出前插入无关内容不改变死代码 key', () => {
+  const root = fixture();
+  write(root, 'backend/lib.js', '// unrelated comment\nexport function used() {}\nexport const unused = 1;\n');
+  const result = run(root);
+  assert.equal(result.status, 0, result.stderr);
+});
+
 test('约定入口、对外出口、import() 表达式里的仓库路径和 guard-allow 标记都不报', () => {
   const root = fixture();
   write(root, 'desktop/src/preload.js', 'export const bridge = 1;\n');
@@ -94,4 +101,21 @@ test('动态加载的模块对象被传出去时按全部导出都用到处理',
   write(root, 'backend/tests/c.test.js', "const mod = await freshImport('backend/q/c.js');\ninspect(mod);\n");
   const result = run(root);
   assert.equal(result.status, 0, result.stderr);
+});
+
+test('静态仓内引用无法解析时 detector health 失败', () => {
+  const root = makeRoot();
+  write(root, 'backend/server.js', "import './missing.js';\n");
+  const result = run(root);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /无法解析仓内静态引用：backend\/server\.js -> \.\/missing\.js/);
+
+  write(root, 'backend/bad.js', 'export const = ;\n');
+  const parseFailure = run(root);
+  assert.equal(parseFailure.status, 1);
+  assert.match(parseFailure.stderr, /解析失败：backend\/bad\.js/);
+
+  const empty = run(makeRoot());
+  assert.equal(empty.status, 1);
+  assert.match(empty.stderr, /没有扫到任何文件/);
 });

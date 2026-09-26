@@ -217,31 +217,42 @@ function collectDuplicates(root) {
   const { parsed, parseFailures } = parseFiles(root, rels, { tokens: true });
   const runs = parsed.flatMap((file) => statementRuns(file, normalizeTokens(file.tree.tokens)));
   const allow = collectAllowMarkers(parsed, 'duplication');
-  return { duplicates: findClones(runs, allow), allow, parseFailures, fileCount: rels.length };
+  return {
+    duplicates: findClones(runs, allow), allow, parseFailures,
+    fileCount: rels.length, parsedFileCount: parsed.length,
+  };
 }
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 function main() {
   const args = parseArgs(process.argv.slice(2), DEFAULT_BASELINE);
-  const { duplicates, allow, parseFailures, fileCount } = collectDuplicates(args.root);
+  const { duplicates, allow, parseFailures, fileCount, parsedFileCount } = collectDuplicates(args.root);
   const groupCount = Object.keys(duplicates).length;
+  const summary = `解析 ${parsedFileCount}/${fileCount} 个文件，重复 ${groupCount} 段（门槛 ${MIN_TOKENS} token）`;
+  const healthFailures = [];
+  if (fileCount === 0) healthFailures.push(`没有扫到任何文件（${SCAN_DIRS.join('、')}），遍历逻辑可能坏了`);
+  if (parsedFileCount !== fileCount) {
+    healthFailures.push(`解析覆盖不完整：计划 ${fileCount} 个文件，成功解析 ${parsedFileCount} 个`);
+  }
+  for (const rel of parseFailures) healthFailures.push(`解析失败：${rel}（espree 无法解析，请检查语法）`);
 
-  if (args.updateBaseline && !parseFailures.length) {
+  if (args.updateBaseline && healthFailures.length) {
+    finish('重复代码守卫', ['detector health 不通过', ...healthFailures], summary);
+  }
+  if (args.updateBaseline) {
     writeBaseline(args.baselinePath, { minTokens: MIN_TOKENS, duplicates });
     console.log(`[duplication] 基线已更新\nFile: ${path.relative(args.root, args.baselinePath)}\n`
-      + `文件: ${fileCount}（重复 ${groupCount} 段写入基线）`);
+      + `${summary} 写入基线`);
     process.exit(0);
   }
 
-  const failures = [];
-  if (fileCount === 0) failures.push(`没有扫到任何文件（${SCAN_DIRS.join('、')}），遍历逻辑可能坏了`);
-  for (const rel of parseFailures) failures.push(`解析失败：${rel}（espree 无法解析，请检查语法）`);
+  const failures = [...healthFailures];
 
   let baseline;
   try {
     baseline = loadBaseline(args.baselinePath, { duplicates: {} });
   } catch (err) {
-    finish('重复代码守卫', [err.message], `扫描 ${fileCount} 个文件`);
+    finish('重复代码守卫', [err.message], summary);
   }
   const current = Object.fromEntries(Object.entries(duplicates).map(([k, v]) => [k, v.locations.length]));
   const recorded = Object.fromEntries(Object.entries(baseline.duplicates || {})
@@ -253,7 +264,7 @@ function main() {
   }));
   failures.push(...allowFailures(allow));
 
-  finish('重复代码守卫', failures, `${fileCount} 个文件，重复 ${groupCount} 段（门槛 ${MIN_TOKENS} token）`,
+  finish('重复代码守卫', failures, summary,
     BASELINE_NOTE, allow.listing());
 }
 

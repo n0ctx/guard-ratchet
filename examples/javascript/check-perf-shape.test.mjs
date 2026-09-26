@@ -64,6 +64,13 @@ test('循环头的取数来源只求值一次，不算循环内查询', () => {
   assert.equal(result.status, 0, result.stderr);
 });
 
+test('在查询函数前增加无关函数，不改变 N+1 finding key', () => {
+  const root = fixture();
+  write(root, 'backend/db/queries/t.js', `export function unrelated() {}\n${QUERIES}`);
+  const result = run(root);
+  assert.equal(result.status, 0, result.stderr);
+});
+
 test('三层循环引用外层变量、新增循环内查询、新增无条件 SELECT 都失败', () => {
   const root = fixture();
   write(root, 'frontend/src/deep.js', [
@@ -132,6 +139,78 @@ test('查询目录里不碰数据库的纯函数不算查询', () => {
   assert.equal(result.status, 1);
   assert.match(result.stderr, /items\.js#load#getViaHelper/);
   assert.doesNotMatch(result.stderr, /#normalize/);
+});
+
+test('db-read 与 db-write 经本地函数和跨模块调用传播，N+1 保持拦截', () => {
+  const root = fixture();
+  write(root, 'backend/db/index.js', 'export default {};\n');
+  write(root, 'backend/db/queries/read.js', [
+    "import db from '../index.js';",
+    "export function byId(id) { return db.prepare('SELECT * FROM items WHERE id = ?').get(id); }",
+    '',
+  ].join('\n'));
+  write(root, 'backend/db/queries/write.js', [
+    "import db from '../index.js';",
+    "export function save(item) { return db.prepare('INSERT INTO items VALUES (?)').run(item); }",
+    '',
+  ].join('\n'));
+  write(root, 'backend/db/queries/facade.js', [
+    "import * as reads from './read.js';",
+    "import { save } from './write.js';",
+    'export function loadOne(id) { return reads.byId(id); }',
+    'export function saveOne(item) { return save(item); }',
+    '',
+  ].join('\n'));
+  write(root, 'backend/services/repeat.js', [
+    "import { loadOne, saveOne } from '../db/queries/facade.js';",
+    'export function repeat(ids) { for (const id of ids) { loadOne(id); saveOne(id); } }',
+    '',
+  ].join('\n'));
+  const result = run(root);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /repeat\.js#repeat#loadOne/);
+  assert.match(result.stderr, /repeat\.js#repeat#saveOne/);
+  assert.match(result.stderr, /查询层 db-read 3 个 \/ db-write 3 个导出/);
+});
+
+test('默认导出的数据库函数仍被识别为查询 effect', () => {
+  const root = fixture();
+  write(root, 'backend/db/index.js', 'export default {};\n');
+  write(root, 'backend/db/queries/default-read.js', [
+    "import db from '../index.js';",
+    "export default function readById(id) { return db.prepare('SELECT * FROM items WHERE id = ?').get(id); }",
+    '',
+  ].join('\n'));
+  write(root, 'backend/services/default-read.js', [
+    "import readById from '../db/queries/default-read.js';",
+    'export function load(ids) { for (const id of ids) readById(id); }',
+    '',
+  ].join('\n'));
+  const result = run(root);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /default-read\.js#load#readById/);
+});
+
+test('解析失败、空目录和不完整扫描不通过，也不写基线', () => {
+  const root = makeRoot();
+  write(root, 'frontend/src/bad.js', 'export const = ;\n');
+  const result = run(root);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /解析失败：frontend\/src\/bad\.js/);
+
+  const update = run(root, '--update-baseline');
+  assert.equal(update.status, 1);
+  assert.match(update.stderr, /detector health 不通过/);
+
+  const importRoot = makeRoot();
+  write(importRoot, 'backend/services/missing.js', "import '../db/queries/nope.js';\n");
+  const unresolved = run(importRoot);
+  assert.equal(unresolved.status, 1);
+  assert.match(unresolved.stderr, /无法解析仓内静态引用：backend\/services\/missing\.js/);
+
+  const empty = run(makeRoot());
+  assert.equal(empty.status, 1);
+  assert.match(empty.stderr, /没有扫到任何文件/);
 });
 
 test('guard-allow 标记覆盖紧随其后的语句段，并在输出里列出', () => {

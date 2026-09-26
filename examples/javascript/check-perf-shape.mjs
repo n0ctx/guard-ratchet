@@ -28,6 +28,7 @@
  */
 
 import path from 'node:path';
+import { buildImportGraph } from './import-graph.mjs';
 import {
   BASELINE_NOTE, allowFailures, baselineFailures, collectAllowMarkers, collectCodeFiles, compareSets, finish,
   isTestPath, loadBaseline, parseArgs, parseFiles, patternNames, section, suffixDuplicates, walk, writeBaseline,
@@ -125,6 +126,7 @@ function importTarget(file, node) {
 // 或调用了会访问数据库的本地函数 / 其他查询文件的导出，都算访问；认不出形状的导出一律算访问。
 function queryShape(file) {
   const imports = new Map();
+  const namespaces = new Map();
   const dbLocals = new Set();
   const locals = new Map();
   const exported = new Map();
@@ -133,7 +135,10 @@ function queryShape(file) {
     if (target) {
       for (const spec of node.specifiers) {
         if (target === DB_MODULE) dbLocals.add(spec.local.name);
-        else if (target.startsWith(QUERY_DIR)) imports.set(spec.local.name, { target, name: spec.imported?.name ?? 'default' });
+        else if (target.startsWith(QUERY_DIR)) {
+          if (spec.type === 'ImportNamespaceSpecifier') namespaces.set(spec.local.name, { target });
+          else imports.set(spec.local.name, { target, name: spec.imported?.name ?? 'default' });
+        }
       }
     }
     const decl = node.type === 'ExportNamedDeclaration' ? node.declaration : node;
@@ -155,78 +160,156 @@ function queryShape(file) {
         if (node.source) imports.set(`#reexport:${spec.exported.name}`, { target: importTarget(file, node), name: local });
         exported.set(spec.exported.name, node.source ? `#reexport:${spec.exported.name}` : local);
       }
+    } else if (node.type === 'ExportDefaultDeclaration') {
+      const decl = node.declaration;
+      const local = decl.id?.name ?? (decl.type === 'Identifier' ? decl.name : '#default');
+      if (FUNCTION_TYPES.has(decl.type)) locals.set(local, decl);
+      else if (!locals.has(local)) locals.set(local, null);
+      exported.set('default', local);
     }
   }
-  return { imports, dbLocals, locals, exported };
+  return { imports, namespaces, dbLocals, locals, exported, statements: statementNames(file.tree) };
 }
 
-function touchesDirectly(fnNode, shape) {
-  for (const [node] of walk(fnNode)) {
-    if (node.type === 'Identifier' && shape.dbLocals.has(node.name)) return true;
-    if (isMethodCall(node, DB_METHODS)) return true;
+const DB_READ = 'db-read';
+const DB_WRITE = 'db-write';
+const ALL_DB_EFFECTS = new Set([DB_READ, DB_WRITE]);
+
+function sqlEffects(node) {
+  const text = sqlText(node);
+  if (text === null) return new Set(ALL_DB_EFFECTS);
+  if (/^\s*(SELECT|EXPLAIN)\b/i.test(text)) return new Set([DB_READ]);
+  if (/^\s*(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|VACUUM|ATTACH|DETACH)\b/i.test(text)) {
+    return new Set([DB_WRITE]);
   }
-  return false;
+  return new Set(ALL_DB_EFFECTS);
 }
 
-function calledNames(fnNode) {
+function directEffects(fnNode, shape) {
+  const effects = new Set();
+  const nodes = [...walk(fnNode)];
+  const parents = new Map(nodes.map(([node, parent]) => [node, parent]));
+  for (const [node, parent] of nodes) {
+    if (node.type === 'Identifier' && shape.dbLocals.has(node.name)) {
+      const call = parent?.type === 'MemberExpression' && parent.object === node ? parents.get(parent) : null;
+      const isDatabaseCall = call?.type === 'CallExpression' && call.callee === parent;
+      if (!isDatabaseCall) ALL_DB_EFFECTS.forEach((effect) => effects.add(effect));
+    }
+    if (node.type !== 'CallExpression' || node.callee.type !== 'MemberExpression') continue;
+    const { object, property } = node.callee;
+    const method = node.callee.computed ? stringValue(property) : property.name;
+    const dbObject = object.type === 'Identifier' && shape.dbLocals.has(object.name);
+    const prepared = object.type === 'CallExpression' && isMethodCall(object, new Set(['prepare']));
+    const statement = object.type === 'Identifier' && shape.statements.has(object.name);
+
+    if (['get', 'all'].includes(method) && (dbObject || prepared || statement)) effects.add(DB_READ);
+    else if (method === 'run' && (dbObject || prepared || statement)) effects.add(DB_WRITE);
+    else if (DB_METHODS.has(method)) sqlEffects(node.arguments[0]).forEach((effect) => effects.add(effect));
+    else if (dbObject) ALL_DB_EFFECTS.forEach((effect) => effects.add(effect));
+  }
+  return effects;
+}
+
+function calledNames(fnNode, shape) {
   const names = new Set();
   for (const [node] of walk(fnNode)) {
-    if (node.type === 'CallExpression' && node.callee.type === 'Identifier') names.add(node.callee.name);
+    if (node.type !== 'CallExpression') continue;
+    if (node.callee.type === 'Identifier') names.add(node.callee.name);
+    else if (node.callee.type === 'MemberExpression' && !node.callee.computed
+        && node.callee.object.type === 'Identifier' && shape.namespaces.has(node.callee.object.name)) {
+      names.add(`${node.callee.object.name}.${node.callee.property.name}`);
+    }
   }
   return names;
 }
 
-function dbTouchingExports(parsed) {
+function dbEffectsByExport(parsed) {
   const shapes = new Map(parsed.filter((f) => f.rel.startsWith(QUERY_DIR)).map((f) => [f.rel, queryShape(f)]));
-  // touching: Map<rel, Set<本地名>>；本地名不是函数（工厂调用结果等）时直接算访问
-  const touching = new Map();
+  const effects = new Map();
   for (const [rel, shape] of shapes) {
-    touching.set(rel, new Set([...shape.locals].filter(([, fn]) => !fn || touchesDirectly(fn, shape)).map(([n]) => n)));
+    const localEffects = new Map();
+    for (const [name, fn] of shape.locals) {
+      localEffects.set(name, fn ? directEffects(fn, shape) : new Set(ALL_DB_EFFECTS));
+    }
+    effects.set(rel, localEffects);
   }
-  const importTouches = (shape, local) => {
-    const ref = shape.imports.get(local);
-    if (!ref) return false;
+
+  const importedEffects = (shape, local, seen = new Set()) => {
+    let ref = shape.imports.get(local);
+    if (!ref) {
+      const dot = local.indexOf('.');
+      const namespace = dot > 0 ? shape.namespaces.get(local.slice(0, dot)) : null;
+      if (namespace) ref = { target: namespace.target, name: local.slice(dot + 1) };
+    }
+    if (!ref) return new Set();
+    const refKey = `${ref.target}:${ref.name}`;
+    if (seen.has(refKey)) return new Set(ALL_DB_EFFECTS);
     const other = shapes.get(ref.target);
-    if (!other) return true;
+    if (!other) return new Set(ALL_DB_EFFECTS);
     const resolved = other.exported.get(ref.name);
-    return resolved === undefined || touching.get(ref.target).has(resolved) || importTouches(other, resolved);
+    if (resolved === undefined) return new Set(ALL_DB_EFFECTS);
+    const known = effects.get(ref.target).get(resolved);
+    if (known) return known;
+    if (other.imports.has(resolved)) return importedEffects(other, resolved, new Set([...seen, refKey]));
+    return new Set(ALL_DB_EFFECTS);
   };
+
   let changed = true;
   while (changed) {
     changed = false;
     for (const [rel, shape] of shapes) {
-      const set = touching.get(rel);
+      const localEffects = effects.get(rel);
       for (const [name, fn] of shape.locals) {
-        if (set.has(name)) continue;
-        const calls = calledNames(fn);
-        if ([...calls].some((c) => set.has(c) || importTouches(shape, c))) {
-          set.add(name);
-          changed = true;
+        if (!fn) continue;
+        const current = localEffects.get(name);
+        const calls = calledNames(fn, shape);
+        for (const callee of calls) {
+          const calledEffects = localEffects.get(callee) ?? importedEffects(shape, callee);
+          for (const effect of calledEffects) {
+            if (!current.has(effect)) {
+              current.add(effect);
+              changed = true;
+            }
+          }
         }
       }
     }
   }
+
   const result = new Map();
   for (const [rel, shape] of shapes) {
-    const set = touching.get(rel);
-    result.set(rel, new Set([...shape.exported]
-      .filter(([, local]) => set.has(local) || importTouches(shape, local) || !shape.locals.has(local) && !shape.imports.has(local))
-      .map(([name]) => name)));
+    const exportedEffects = new Map();
+    for (const [name, local] of shape.exported) {
+      exportedEffects.set(name, effects.get(rel).get(local) ?? importedEffects(shape, local));
+    }
+    result.set(rel, exportedEffects);
   }
-  return result;
+  let dbReadExports = 0;
+  let dbWriteExports = 0;
+  for (const exports of result.values()) {
+    for (const effectSet of exports.values()) {
+      if (effectSet.has(DB_READ)) dbReadExports += 1;
+      if (effectSet.has(DB_WRITE)) dbWriteExports += 1;
+    }
+  }
+  return { byExport: result, dbReadExports, dbWriteExports };
 }
 
-// 从 backend/db/queries/ 导入、会访问数据库的本地名：names 是具名/默认导入，namespaces 是 import * as
-function queryImports(file, touchingExports) {
+// 从查询层导入具有数据库 effect 的本地名；namespace import 逐个检查导出。
+function queryImports(file, effectsByExport) {
   const names = new Set();
   const namespaces = new Set();
   for (const node of file.tree.body) {
     const target = importTarget(file, node);
     if (!target?.startsWith(QUERY_DIR)) continue;
-    const touching = touchingExports.get(target);
+    const effects = effectsByExport.get(target);
     for (const spec of node.specifiers) {
-      if (spec.type === 'ImportNamespaceSpecifier') namespaces.add(spec.local.name);
-      else if (!touching || touching.has(spec.imported?.name ?? 'default')) names.add(spec.local.name);
+      if (spec.type === 'ImportNamespaceSpecifier') {
+        if (!effects) namespaces.add(`${spec.local.name}.*`);
+        else for (const [name, effectSet] of effects) {
+          if (effectSet.size) namespaces.add(`${spec.local.name}.${name}`);
+        }
+      } else if (!effects || effects.get(spec.imported?.name ?? 'default')?.size) names.add(spec.local.name);
     }
   }
   return { names, namespaces };
@@ -274,7 +357,8 @@ function loopQueryCall(node, { stmtNames, queries }) {
   const { callee } = node;
   if (callee.type === 'Identifier' && queries.names.has(callee.name)) return callee.name;
   if (callee.type === 'MemberExpression' && !callee.computed && callee.object.type === 'Identifier'
-      && queries.namespaces.has(callee.object.name)) return `${callee.object.name}.${callee.property.name}`;
+      && (queries.namespaces.has(`${callee.object.name}.${callee.property.name}`)
+        || queries.namespaces.has(`${callee.object.name}.*`))) return `${callee.object.name}.${callee.property.name}`;
   if (isMethodCall(node, new Set(['prepare']))) {
     const obj = node.callee.object;
     return obj.type === 'Identifier' ? `${obj.name}.prepare` : '.prepare';
@@ -350,27 +434,35 @@ function visit(node, parent, state, ctx) {
 // ─── 汇总 ────────────────────────────────────────────────────────────────────
 function collectPerfShape(root) {
   const rels = SCAN_DIRS.flatMap((dir) => collectCodeFiles(root, dir)).filter((rel) => !isTestPath(rel));
-  const { parsed, parseFailures } = parseFiles(root, rels);
+  const graph = buildImportGraph(root, rels, parseFiles(root, rels));
+  const { parsed, parseFailures, modules, unresolvedStaticImports } = graph;
   const found = { hard: [], loopQueries: [], selects: [] };
   const allow = collectAllowMarkers(parsed, 'perf-shape');
-  const touchingExports = dbTouchingExports(parsed);
+  const queryEffects = dbEffectsByExport(parsed);
   for (const file of parsed) {
     const sqlScope = SQL_DIRS.some((dir) => file.rel.startsWith(dir)) && !SQL_EXEMPT.has(file.rel);
     const ctx = {
       file, found, sqlScope, allow,
       stmtNames: statementNames(file.tree),
-      queries: queryImports(file, touchingExports),
+      queries: queryImports(file, queryEffects.byExport),
       txFunctions: transactionalFunctions(file.tree),
     };
     visit(file.tree, null, { loops: [], perItem: false, inTx: false, fn: '(顶层)' }, ctx);
   }
+  const edges = new Set([...modules].flatMap(([source, mod]) => mod.refs.map(({ target }) => `${source} -> ${target}`)));
   return {
     allow,
     hard: found.hard,
     loopQueries: suffixDuplicates(found.loopQueries),
     selects: suffixDuplicates(found.selects),
     parseFailures,
+    unresolvedStaticImports,
     fileCount: rels.length,
+    parsedFileCount: parsed.length,
+    moduleCount: modules.size,
+    edgeCount: edges.size,
+    dbReadExports: queryEffects.dbReadExports,
+    dbWriteExports: queryEffects.dbWriteExports,
   };
 }
 
@@ -378,18 +470,35 @@ function collectPerfShape(root) {
 function main() {
   const args = parseArgs(process.argv.slice(2), DEFAULT_BASELINE);
   const shape = collectPerfShape(args.root);
-  const summary = `${shape.fileCount} 个文件，循环内查询 ${shape.loopQueries.length} 处、`
-    + `无 WHERE/LIMIT 的 SELECT ${shape.selects.length} 处`;
+  const summary = `解析 ${shape.parsedFileCount}/${shape.fileCount} 个文件，${shape.moduleCount} 个模块 / ${shape.edgeCount} 条依赖边，`
+    + `循环内查询 ${shape.loopQueries.length} 处、`
+    + `无 WHERE/LIMIT 的 SELECT ${shape.selects.length} 处；查询层 db-read ${shape.dbReadExports} 个 / `
+    + `db-write ${shape.dbWriteExports} 个导出`;
 
-  if (args.updateBaseline && !shape.parseFailures.length) {
+  const healthFailures = [];
+  if (shape.fileCount === 0) healthFailures.push(`没有扫到任何文件（${SCAN_DIRS.join('、')}），遍历逻辑可能坏了`);
+  if (shape.parsedFileCount !== shape.fileCount) {
+    healthFailures.push(`解析覆盖不完整：计划 ${shape.fileCount} 个文件，成功解析 ${shape.parsedFileCount} 个`);
+  }
+  if (shape.moduleCount !== shape.parsedFileCount) {
+    healthFailures.push(`依赖图构建不完整：已解析 ${shape.parsedFileCount} 个文件，仅构建 ${shape.moduleCount} 个模块`);
+  }
+  for (const rel of shape.parseFailures) healthFailures.push(`解析失败：${rel}（espree 无法解析，请检查语法）`);
+  for (const ref of shape.unresolvedStaticImports) {
+    healthFailures.push(`无法解析仓内静态引用：${ref.source} -> ${ref.specifier}（目标 ${ref.target}）`);
+  }
+
+  if (args.updateBaseline && healthFailures.length) {
+    finish('运行形态守卫', ['detector health 不通过', ...healthFailures], summary);
+  }
+  if (args.updateBaseline) {
     writeBaseline(args.baselinePath, { loopQueries: shape.loopQueries, selectsWithoutFilter: shape.selects });
     console.log(`[perf-shape] 基线已更新\nFile: ${path.relative(args.root, args.baselinePath)}\n${summary}写入基线`);
     process.exit(0);
   }
 
   const failures = [];
-  if (shape.fileCount === 0) failures.push(`没有扫到任何文件（${SCAN_DIRS.join('、')}），遍历逻辑可能坏了`);
-  for (const rel of shape.parseFailures) failures.push(`解析失败：${rel}（espree 无法解析，请检查语法）`);
+  failures.push(...healthFailures);
   if (shape.hard.length) failures.push(section('运行形态违规（不进基线，必须改掉）：', shape.hard));
 
   let baseline;

@@ -21,6 +21,7 @@
 - 复杂度：ESLint `complexity` 规则 + `-f json`；或自己按 AST 计数（见 `examples/javascript/check-complexity.mjs`）。
 - 死代码：knip（未用文件、导出、依赖），对 monorepo 和各种框架约定有内建支持。
 - 重复：jscpd。
+- 架构边界：先复用仓库已有 import graph；其次考虑 dependency-cruiser 的禁止依赖和分层规则，或仓库已有生态里的 ESLint `import/no-internal-modules`。自研时沿用简单路径边规则。
 - 循环依赖：madge（`--circular --json`）、dependency-cruiser（还能写分层规则）。
 - 测试形态：自己按 AST 查 `it/test/describe` 调用、`.only`、`expect(`、`setTimeout` 字面量。
 - 约定式加载要留意：Next.js/Nuxt 等文件路由、Vite/ESLint/Vitest 配置文件、`React.lazy(() => import('...'))`、测试辅助的字符串路径加载。
@@ -32,7 +33,8 @@
 - 复杂度：radon（`radon cc -j`）或 lizard；也可以用 `ast` 自己计数。
 - 死代码：vulture（带置信度，建议只取 100% 置信的或自己设门槛）；自研时用 `ast` 建 import 图。
 - 重复：pylint 的 duplicate-code（R0801）或 jscpd。
-- 循环依赖 / 分层：用 `ast` 建 import 图求强连通分量；分层约束可用 import-linter。`from pkg import sub` 的边落到子模块、不连包入口，见 `guard-catalog.md` 第 7 节。
+- 架构边界：import-linter 可检查分层、禁止导入和 package boundary。
+- 循环依赖：用 `ast` 建 import 图求强连通分量。`from pkg import sub` 的边落到子模块、不连包入口，见 `guard-catalog.md` 第 7 节。
 - 测试形态：pytest 的 `@pytest.mark.skip`、`pytest.skip()`、`time.sleep(x)`；没有 `assert` 语句也没有 `pytest.raises`/mock 断言的测试函数。
 - N+1：循环或推导式里对 ORM 的逐项查询（Django `Model.objects.get`、SQLAlchemy `session.get/execute`、`cursor.execute`）。`ast.For.iter` 和推导式 `generators[0].iter` 只求值一次，不算循环里，见 `guard-catalog.md` 第 6 节。
 - 约定式加载：`conftest.py`、Django 的 `apps.py`/`admin.py`/`migrations`、`entry_points`、`__init__.py` 的再导出、插件目录。
@@ -43,7 +45,7 @@
 - 复杂度：gocyclo、gocognit。
 - 死代码：`golang.org/x/tools/cmd/deadcode`（从 main 出发的可达性）、staticcheck 的 U1000。
 - 重复：dupl。
-- 循环依赖：编译器禁止包级循环导入，不需要这个守卫。
+- 循环依赖：Go 编译器禁止 package import cycle，不需要这个守卫；package/module 的依赖方向仍可单独守。
 - 测试形态：Go 没有断言库时以 `t.Error*`/`t.Fatal*`/testify 调用为断言；`t.Skip`；`time.Sleep`。
 - N+1：循环里调用 `db.Query*`/`QueryRow*`/`Exec*` 或 repository 方法。
 
@@ -52,7 +54,7 @@
 - 解析：JavaParser；Kotlin 用 kotlin-compiler-embeddable 的 PSI 或 detekt 的规则框架。
 - 复杂度：PMD（CyclomaticComplexity）、detekt（Kotlin）、lizard。
 - 重复：PMD CPD。
-- 循环依赖 / 分层：ArchUnit（`slices().should().beFreeOfCycles()`、分层规则），写成测试即可。
+- 架构边界与循环依赖：ArchUnit 可检查 layered architecture、slices/cycles、package access 和依赖方向，写成测试即可。
 - 测试形态：`@Disabled`/`@Ignore`、`Thread.sleep`、没有 assert/verify 的 `@Test` 方法。
 
 ## Rust

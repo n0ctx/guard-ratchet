@@ -24,7 +24,7 @@ export const BASELINE_NOTE = '，基线外无新增';
 
 export const CODE_SUFFIXES = new Set(['.js', '.jsx', '.mjs', '.cjs']);
 const SKIP_DIRS = new Set([
-  'node_modules', 'dist', 'coverage', 'build', 'test-results', 'data', 'node-runtime',
+  'node_modules', 'vendor', 'generated', 'dist', 'coverage', 'build', 'test-results', 'data', 'node-runtime',
 ]);
 
 export function isTestPath(rel) {

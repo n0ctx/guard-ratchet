@@ -15,6 +15,7 @@
 | 重复代码 | 抹掉标识符后仍相同的连续语句（纯简单调用串要求逐字相同） |
 | 运行形态 | 循环里逐条查库（N+1）、三层嵌套循环、没有 WHERE/LIMIT 的 SELECT |
 | 循环依赖 | 模块之间加载期互相引用 |
+| 架构边界 | 禁止的层间依赖、跨模块 internal/deep import |
 
 skill 不会一股脑全上，而是按仓库实际情况挑选，例如没有数据库就不加 N+1 守卫，Go 编译器已禁止包循环就不加循环依赖守卫。
 
@@ -25,7 +26,7 @@ skill 不会一股脑全上，而是按仓库实际情况挑选，例如没有�
 - **棘轮**（不随仓库变化）：发现与基线怎么比、什么算失败、基线怎么更新。由规格 `references/contract.md`、参考实现 `scripts/ratchet.py`（Python 标准库，无依赖）和一致性用例 `conformance/cases.json` 固定下来。
 - **检测器**（随语言和仓库变化）：由 agent 在当前仓库里按顺序选择——仓库已有工具 → 成熟的现成工具 → 用该语言的解析器自己写。
 
-检测器只需输出 `{rule, key, count}` 形式的发现；比对优先直接复用 `ratchet.py`，环境里没有 Python 时再用仓库主语言重写，前提是通过全部一致性用例。
+检测器输出 `{rule, key, count}` 形式的发现。自研检测器还必须满足 Detector Contract，证明扫描范围、覆盖量、key 和失败行为可信。比对优先直接复用 `ratchet.py`，环境里没有 Python 时再用仓库主语言重写，前提是通过全部一致性用例。
 
 每条规则分三级：**硬规则**（出现即失败，不进基线）、**基线规则**（存量记下，只许减少）、**提示级**（可选，只打印不失败，用于接近门槛的提醒或不确定的信号）。
 
@@ -50,7 +51,7 @@ ln -s ~/.agents/skills/guard-ratchet ~/.claude/skills/guard-ratchet
 - 「npm run lint 加上复制粘贴检查和循环依赖检查，不要加依赖。src/report.js 里有同事没提交的改动，别让它混进基线。」
 - 「Go 项目，复杂度超过 15 的函数不许新增、已有的不许再变复杂。」
 
-agent 会按 `SKILL.md` 的流程：摸清仓库 → 选守卫 → 选检测器 → 实现 → 从干净提交生成基线 → 接入 lint/CI → 为每个守卫写夹具测试 → 汇报。
+agent 会按 `SKILL.md` 的流程：摸清仓库 → 选守卫 → 选检测器 → 定义 detector invariants → 实现并验证 detector → 生成基线 → 接入 lint/CI → 真实仓库验证 → 汇报。
 
 单独使用参考实现：
 
@@ -66,12 +67,15 @@ my-detector | python3 scripts/ratchet.py update --findings - --baseline guards/c
 SKILL.md                      流程与验收标准（agent 入口）
 references/
   contract.md                 棘轮语义、发现与基线格式、命令行约定
+  detector-contract.md        自研检测器的正确性与覆盖要求
   guard-catalog.md            每种守卫的信号、key 设计、默认门槛、常见误报
   language-recipes.md         各语言可用的解析器和现成工具
   pitfalls.md                 真实落地时踩过的坑
 scripts/ratchet.py            棘轮参考实现
 conformance/cases.json        棘轮一致性用例
-examples/javascript/          一套落地过的 JavaScript 实现（espree，6 个守卫，含夹具测试）
+examples/javascript/
+  check-architecture.mjs     简单路径规则的架构边界参考实现
+  README.md                  JavaScript 参考实现说明与 Detector Contract 测试类型
 ```
 
 ## 评测
